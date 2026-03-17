@@ -1,0 +1,19 @@
+# 1. 本地数据库文件 (绝对不能上传，否则会覆盖云端数据或泄露隐私)
+memories.db
+
+# 2. Python 运行时的缓存垃圾
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 3. Mac 系统的隐藏垃圾文件
+.DS_Store
+
+# 4. 如果你本地建了虚拟环境，忽略它们
+venv/
+env/
+.venv/
+
+# 5. 编辑器配置 (如 VS Code 的配置文件)
+.vscode/
+.idea/
