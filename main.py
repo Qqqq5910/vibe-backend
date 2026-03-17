@@ -1,4 +1,9 @@
+import os
+import uuid
+import base64
 from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
 import json
@@ -10,22 +15,37 @@ from datetime import datetime
 
 app = FastAPI()
 
-# ⚠️ 替换为你的真实 Key
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+os.makedirs("uploads", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+# ==========================================
+# 🔑 请填入你刚才的真实 API Key
+# ==========================================
 QWEN_API_KEY = "sk-caff47c35d20412c9561042bcbd14641"
 AMAP_KEY = "2241cf1577bb0f2893404b727066270d"
 
+
 # ==========================================
-# 数据库初始化 (SQLite)
+# 数据库初始化 
 # ==========================================
 def init_db():
     conn = sqlite3.connect("memories.db")
     cursor = conn.cursor()
-    # 创建记忆表
+    # 每次启动不删表了，保留你的历史数据
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS memory_pool (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             brand TEXT NOT NULL,
             city TEXT NOT NULL,
+            image_url TEXT,
             created_at TEXT NOT NULL
         )
     """)
@@ -53,15 +73,19 @@ def calculate_haversine_distance(lon1, lat1, lon2, lat2):
     return int(c * 6371000)
 
 # ==========================================
-# 接口 1：上传与解析 (入库)
+# 接口 1：上传与解析 (强化版 Prompt)
 # ==========================================
 @app.post("/api/upload")
 def upload_memory(request: UploadRequest):
     print(">>> 收到新截图，正在请求大模型解析...")
     client = OpenAI(api_key=QWEN_API_KEY, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+    
+    # 🌟 核心修改 1：让 AI 只提取最核心的品牌名
     system_prompt = """
-    你是一个精准的商业实体提取引擎。提取截图中的品牌名（brand）和城市（city）。
-    必须以 JSON 返回，示例：{"brand": "W Coffee", "city": "上海"}。若无城市线索填"unknown"。
+    你是一个精准的商业实体提取引擎。提取截图中的【核心品牌名】（brand）和城市（city）。
+    ⚠️ 核心规则：只提取最核心的招牌名字！绝对不要带上菜系、分店名或标点符号后缀。
+    例如：看到“鸟喆·烧鸟·炉端烧”，只提取“鸟喆”；看到“海底捞火锅(南京路店)”，只提取“海底捞”。
+    必须以 JSON 返回，示例：{"brand": "鸟喆", "city": "上海"}。若无城市线索填"unknown"。
     绝不要输出任何多余字符。
     """
     try:
@@ -85,11 +109,21 @@ def upload_memory(request: UploadRequest):
     if not brand_name:
         raise HTTPException(status_code=400, detail="未提取到有效商铺信息")
 
-    # 存入数据库
+    # 保存图片
+    try:
+        image_data = base64.b64decode(request.image_base64)
+        filename = f"{uuid.uuid4().hex}.jpg"
+        filepath = os.path.join("uploads", filename)
+        with open(filepath, "wb") as f:
+            f.write(image_data)
+        image_url = f"http://192.168.3.131:8000/uploads/{filename}"
+    except Exception as e:
+        image_url = ""
+
     conn = sqlite3.connect("memories.db")
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO memory_pool (brand, city, created_at) VALUES (?, ?, ?)", 
-                   (brand_name, city_hint, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    cursor.execute("INSERT INTO memory_pool (brand, city, image_url, created_at) VALUES (?, ?, ?, ?)", 
+                   (brand_name, city_hint, image_url, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
     conn.close()
     
@@ -97,13 +131,12 @@ def upload_memory(request: UploadRequest):
     return {"status": "success", "message": f"成功保存：{brand_name}"}
 
 # ==========================================
-# 接口 2：发现周边 (出库召回)
+# 接口 2：发现周边 (加入模糊切词引擎)
 # ==========================================
 @app.post("/api/nearby")
 def discover_nearby(request: NearbyRequest):
     print(f">>> 开始扫描周边: 经度 {request.lon}, 纬度 {request.lat}")
     
-    # 1. 从数据库捞出所有去重后的品牌
     conn = sqlite3.connect("memories.db")
     cursor = conn.cursor()
     cursor.execute("SELECT DISTINCT brand, city FROM memory_pool")
@@ -115,11 +148,8 @@ def discover_nearby(request: NearbyRequest):
 
     amap_url = "https://restapi.amap.com/v3/place/text"
     nearby_results = []
-    
-    # 设定唤醒阈值：只展示距离你 3000 米以内的收藏
     DISTANCE_THRESHOLD = 3000 
 
-    # 2. 批量请求高德验证位置
     for brand_name, city_hint in saved_memories:
         params = {
             "key": AMAP_KEY,
@@ -134,10 +164,17 @@ def discover_nearby(request: NearbyRequest):
             amap_resp = requests.get(amap_url, params=params).json()
             if amap_resp.get("status") == "1":
                 for poi in amap_resp.get("pois", []):
-                    # 严格名称过滤
-                    if brand_name.lower().replace(" ", "") in poi['name'].lower().replace(" ", ""):
+                    
+                    # 🌟 核心修改 2：智能模糊容错过滤
+                    # 剥离数据库品牌的后缀
+                    core_brand = brand_name.split('·')[0].split('(')[0].split('（')[0].split(' ')[0].strip().lower()
+                    # 剥离高德返回 POI 的后缀
+                    core_poi = poi.get('name', '').split('(')[0].split('（')[0].split(' ')[0].strip().lower()
+                    
+                    # 只要核心词互相包含，即判定为命中
+                    if core_brand in core_poi or core_poi in core_brand:
                         raw_dist = poi.get("distance")
-                        final_dist = 99999999 # 默认极大值
+                        final_dist = 99999999 
                         
                         if isinstance(raw_dist, str) and raw_dist.isdigit():
                             final_dist = int(raw_dist)
@@ -147,7 +184,6 @@ def discover_nearby(request: NearbyRequest):
                                 poi_lon, poi_lat = poi_location.split(",")
                                 final_dist = calculate_haversine_distance(request.lon, request.lat, poi_lon, poi_lat)
 
-                        # 【核心过滤】只有在这个阈值内的店，才会被“唤醒”推给前端
                         if final_dist <= DISTANCE_THRESHOLD:
                             nearby_results.append({
                                 "name": poi.get("name", ""),
@@ -160,26 +196,22 @@ def discover_nearby(request: NearbyRequest):
 
     print(f"✅ 扫描完毕，发现 {len(nearby_results)} 家在附近。")
     return nearby_results
+
 # ==========================================
-# 接口 3：查看所有胶囊 (查询库)
+# 接口 3：查看所有胶囊
 # ==========================================
 @app.get("/api/memories")
 def get_all_memories():
     conn = sqlite3.connect("memories.db")
     cursor = conn.cursor()
-    # 按存入时间倒序拉取
-    cursor.execute("SELECT id, brand, city, created_at FROM memory_pool ORDER BY id DESC")
+    cursor.execute("SELECT id, brand, city, created_at, image_url FROM memory_pool ORDER BY id DESC")
     rows = cursor.fetchall()
     conn.close()
     
-    # 组装成 JSON 数组返回
-    return [
-        {"id": r[0], "brand": r[1], "city": r[2], "created_at": r[3]}
-        for r in rows
-    ]
+    return [{"id": r[0], "brand": r[1], "city": r[2], "created_at": r[3], "image_url": r[4]} for r in rows]
 
 # ==========================================
-# 接口 4：删除指定胶囊 (出库/拔草)
+# 接口 4：删除指定胶囊
 # ==========================================
 @app.delete("/api/memories/{memory_id}")
 def delete_memory(memory_id: int):
@@ -189,5 +221,6 @@ def delete_memory(memory_id: int):
     conn.commit()
     conn.close()
     return {"status": "success", "message": "删除成功"}
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
