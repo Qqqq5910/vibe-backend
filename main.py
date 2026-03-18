@@ -117,27 +117,41 @@ async def upload_memory(request_data: UploadRequest, request: Request):
 
 @app.post("/api/nearby")
 async def discover_nearby(request: NearbyRequest):
+    # 🌟 核心修复 1：增加日志输出，打破服务端黑盒状态
+    print(f"📍 [周边雷达] 接收到前端坐标 - 纬度(lat): {request.lat}, 经度(lon): {request.lon}")
+    
+    # 阻断无效请求：如果依然收到 0.0，说明前端定位失败，直接返回空列表节约算力
+    if request.lat == 0.0 and request.lon == 0.0:
+        print("⚠️ 警告：接收到无效坐标 (0.0, 0.0)，已拦截对高德 API 的无效调用")
+        return []
+
     conn = sqlite3.connect("memories.db")
     cursor = conn.cursor()
     cursor.execute("SELECT DISTINCT brand, city FROM memory_pool")
     saved_memories = cursor.fetchall()
     conn.close()
 
-    if not saved_memories: return []
+    if not saved_memories: 
+        print("ℹ️ 数据库中无胶囊记忆，跳过扫描")
+        return []
 
-    amap_url = "https://restapi.amap.com/v3/place/text"
+    # 🌟 核心修复 2：将高德 API 升级为 `place/around` (周边搜索)，对距离排序支持更好
+    amap_url = "https://restapi.amap.com/v3/place/around"
     nearby_results = []
+    
     for brand_name, city_hint in saved_memories:
         params = {
-            "key": AMAP_KEY, "keywords": brand_name,
-            "city": city_hint if city_hint != "unknown" else "",
-            "location": f"{request.lon},{request.lat}"
+            "key": AMAP_KEY, 
+            "keywords": brand_name,
+            "location": f"{request.lon},{request.lat}",
+            "radius": "3000", # 限制搜索半径 3 公里
+            "sortrule": "distance" # 严格按照距离排序
         }
         try:
             res = requests.get(amap_url, params=params).json()
             if res.get("status") == "1":
                 for poi in res.get("pois", []):
-                    # 模糊匹配逻辑：适配“大众点评名字”与“高德名字”不一致
+                    # 模糊匹配逻辑
                     core_brand = brand_name.split('·')[0].split('(')[0].split('（')[0].strip().lower()
                     core_poi = poi.get('name','').split('(')[0].split('（')[0].strip().lower()
                     
@@ -150,7 +164,11 @@ async def discover_nearby(request: NearbyRequest):
                                 "address": poi.get("address", ""),
                                 "distance": str(dist)
                             })
-        except: continue
+        except Exception as e: 
+            print(f"❌ 请求高德 API 发生异常: {e}")
+            continue
+            
+    print(f"✅ 扫描完成，找到 {len(nearby_results)} 家匹配店铺")
     return nearby_results
 
 @app.get("/api/memories")
