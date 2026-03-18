@@ -27,7 +27,7 @@ app.add_middleware(
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
-# 🔑 你的 API Key (请确保这里是你真实的 Key)
+# 🔑 你的 API Key
 QWEN_API_KEY = "sk-caff47c35d20412c9561042bcbd14641"
 AMAP_KEY = "2241cf1577bb0f2893404b727066270d"
 
@@ -54,6 +54,42 @@ class UploadRequest(BaseModel):
 class NearbyRequest(BaseModel):
     lat: float
     lon: float
+
+# 🌟 核心修复：WGS84 转 GCJ02 算法常量及函数
+pi = 3.1415926535897932384626
+a = 6378245.0
+ee = 0.00669342162296594323
+
+def wgs84_to_gcj02(lng, lat):
+    """将 iOS 的 WGS-84 坐标转换为高德的 GCJ-02 坐标"""
+    # 粗略判断是否在国内，不在国内则不转换
+    if not (72.004 <= lng <= 137.8347 and 0.8293 <= lat <= 55.8271):
+        return lng, lat
+        
+    def transform_lat(lng, lat):
+        ret = -100.0 + 2.0 * lng + 3.0 * lat + 0.2 * lat * lat + 0.1 * lng * lat + 0.2 * math.sqrt(abs(lng))
+        ret += (20.0 * math.sin(6.0 * lng * pi) + 20.0 * math.sin(2.0 * lng * pi)) * 2.0 / 3.0
+        ret += (20.0 * math.sin(lat * pi) + 40.0 * math.sin(lat / 3.0 * pi)) * 2.0 / 3.0
+        ret += (160.0 * math.sin(lat / 12.0 * pi) + 320 * math.sin(lat * pi / 30.0)) * 2.0 / 3.0
+        return ret
+
+    def transform_lng(lng, lat):
+        ret = 300.0 + lng + 2.0 * lat + 0.1 * lng * lng + 0.1 * lng * lat + 0.1 * math.sqrt(abs(lng))
+        ret += (20.0 * math.sin(6.0 * lng * pi) + 20.0 * math.sin(2.0 * lng * pi)) * 2.0 / 3.0
+        ret += (20.0 * math.sin(lng * pi) + 40.0 * math.sin(lng / 3.0 * pi)) * 2.0 / 3.0
+        ret += (150.0 * math.sin(lng / 12.0 * pi) + 300.0 * math.sin(lng / 30.0 * pi)) * 2.0 / 3.0
+        return ret
+
+    dlat = transform_lat(lng - 105.0, lat - 35.0)
+    dlng = transform_lng(lng - 105.0, lat - 35.0)
+    radlat = lat / 180.0 * pi
+    magic = math.sin(radlat)
+    magic = 1 - ee * magic * magic
+    sqrtmagic = math.sqrt(magic)
+    dlat = (dlat * 180.0) / ((a * (1 - ee)) / (magic * sqrtmagic) * pi)
+    dlng = (dlng * 180.0) / (a / sqrtmagic * math.cos(radlat) * pi)
+    
+    return lng + dlng, lat + dlat
 
 def calculate_haversine_distance(lon1, lat1, lon2, lat2):
     lon1, lat1, lon2, lat2 = map(math.radians, [float(lon1), float(lat1), float(lon2), float(lat2)])
@@ -92,7 +128,6 @@ async def upload_memory(request_data: UploadRequest, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail="AI 解析失败")
 
-    # 🌟 核心升级：图片保存并动态适配公网 URL
     try:
         image_data = base64.b64decode(request_data.image_base64)
         filename = f"{uuid.uuid4().hex}.jpg"
@@ -100,7 +135,6 @@ async def upload_memory(request_data: UploadRequest, request: Request):
         with open(filepath, "wb") as f:
             f.write(image_data)
         
-        # 自动识别 vibe-backend.zeabur.app 域名
         base_url = str(request.base_url).rstrip('/')
         image_url = f"{base_url}/uploads/{filename}"
     except Exception as e:
@@ -117,13 +151,15 @@ async def upload_memory(request_data: UploadRequest, request: Request):
 
 @app.post("/api/nearby")
 async def discover_nearby(request: NearbyRequest):
-    # 🌟 核心修复 1：增加日志输出，打破服务端黑盒状态
-    print(f"📍 [周边雷达] 接收到前端坐标 - 纬度(lat): {request.lat}, 经度(lon): {request.lon}")
+    print(f"📍 [周边雷达] 接收到原始 WGS-84 坐标 - 纬度(lat): {request.lat}, 经度(lon): {request.lon}")
     
-    # 阻断无效请求：如果依然收到 0.0，说明前端定位失败，直接返回空列表节约算力
     if request.lat == 0.0 and request.lon == 0.0:
         print("⚠️ 警告：接收到无效坐标 (0.0, 0.0)，已拦截对高德 API 的无效调用")
         return []
+
+    # 🌟 关键动作：执行坐标系转换
+    gcj_lon, gcj_lat = wgs84_to_gcj02(request.lon, request.lat)
+    print(f"🌐 [周边雷达] 转换后的 GCJ-02 坐标 - 纬度(lat): {gcj_lat}, 经度(lon): {gcj_lon}")
 
     conn = sqlite3.connect("memories.db")
     cursor = conn.cursor()
@@ -135,7 +171,6 @@ async def discover_nearby(request: NearbyRequest):
         print("ℹ️ 数据库中无胶囊记忆，跳过扫描")
         return []
 
-    # 🌟 核心修复 2：将高德 API 升级为 `place/around` (周边搜索)，对距离排序支持更好
     amap_url = "https://restapi.amap.com/v3/place/around"
     nearby_results = []
     
@@ -143,15 +178,15 @@ async def discover_nearby(request: NearbyRequest):
         params = {
             "key": AMAP_KEY, 
             "keywords": brand_name,
-            "location": f"{request.lon},{request.lat}",
-            "radius": "3000", # 限制搜索半径 3 公里
-            "sortrule": "distance" # 严格按照距离排序
+            # 🌟 传入转换后的高德专属坐标
+            "location": f"{gcj_lon},{gcj_lat}",
+            "radius": "3000",
+            "sortrule": "distance"
         }
         try:
             res = requests.get(amap_url, params=params).json()
             if res.get("status") == "1":
                 for poi in res.get("pois", []):
-                    # 模糊匹配逻辑
                     core_brand = brand_name.split('·')[0].split('(')[0].split('（')[0].strip().lower()
                     core_poi = poi.get('name','').split('(')[0].split('（')[0].strip().lower()
                     
