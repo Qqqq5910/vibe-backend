@@ -40,21 +40,15 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
-    
-    # 🌟 核心升级：数据库字段热迁移，兼容已有数据表
     cursor.execute("PRAGMA table_info(memory_pool)")
     columns = [info[1] for info in cursor.fetchall()]
     if "device_id" not in columns:
-        print("🔧 检测到旧版数据库，正在追加 device_id 字段...")
-        # 已有数据的默认设备号设为 'anonymous'
         cursor.execute("ALTER TABLE memory_pool ADD COLUMN device_id TEXT DEFAULT 'anonymous'")
-        
     conn.commit()
     conn.close()
 
 init_db()
 
-# 🌟 Pydantic 模型升级：强制要求提供 device_id
 class UploadRequest(BaseModel):
     image_base64: str
     device_id: str
@@ -68,6 +62,7 @@ pi = 3.1415926535897932384626
 a = 6378245.0
 ee = 0.00669342162296594323
 
+# WGS84 转 GCJ02 (iOS 到 高德)
 def wgs84_to_gcj02(lng, lat):
     if not (72.004 <= lng <= 137.8347 and 0.8293 <= lat <= 55.8271):
         return lng, lat
@@ -93,11 +88,17 @@ def wgs84_to_gcj02(lng, lat):
     dlng = (dlng * 180.0) / (a / sqrtmagic * math.cos(radlat) * pi)
     return lng + dlng, lat + dlat
 
+# 🌟 新增：GCJ02 转 WGS84 (高德 到 Apple MapKit)
+def gcj02_to_wgs84(lng, lat):
+    if not (72.004 <= lng <= 137.8347 and 0.8293 <= lat <= 55.8271):
+        return lng, lat
+    m_lng, m_lat = wgs84_to_gcj02(lng, lat)
+    # 利用偏移量进行近似逆推，对于 iOS 地图显示和 200米围栏精度已足够
+    return lng * 2 - m_lng, lat * 2 - m_lat
+
 @app.post("/api/upload")
 async def upload_memory(request_data: UploadRequest, request: Request):
-    print(f">>> 收到用户 [{request_data.device_id}] 的新截图...")
     client = OpenAI(api_key=QWEN_API_KEY, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
-    
     system_prompt = """
     你是一个精准的商业实体提取引擎。提取截图中的【核心品牌名】（brand）和城市（city）。
     ⚠️ 核心规则：只提取最核心的招牌名字！绝对不要带上菜系、分店名或标点符号后缀。
@@ -108,10 +109,7 @@ async def upload_memory(request_data: UploadRequest, request: Request):
             model="qwen-vl-max",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": [
-                    {"type": "text", "text": "提取图片中的核心商户及城市。"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{request_data.image_base64}"}}
-                ]}
+                {"role": "user", "content": [{"type": "text", "text": "提取图片中的核心商户及城市。"}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{request_data.image_base64}"}}]}
             ],
             response_format={"type": "json_object"}
         )
@@ -127,20 +125,17 @@ async def upload_memory(request_data: UploadRequest, request: Request):
         filepath = os.path.join("uploads", filename)
         with open(filepath, "wb") as f:
             f.write(image_data)
-        
         base_url = str(request.base_url).rstrip('/')
         image_url = f"{base_url}/uploads/{filename}"
     except Exception as e:
         image_url = ""
 
-    # 🌟 写入时绑定 device_id
     conn = sqlite3.connect("memories.db")
     cursor = conn.cursor()
     cursor.execute("INSERT INTO memory_pool (brand, city, image_url, created_at, device_id) VALUES (?, ?, ?, ?, ?)", 
                    (brand_name, city_hint, image_url, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), request_data.device_id))
     conn.commit()
     conn.close()
-    
     return {"status": "success", "message": f"成功保存：{brand_name}"}
 
 @app.post("/api/nearby")
@@ -150,7 +145,6 @@ async def discover_nearby(request: NearbyRequest):
 
     gcj_lon, gcj_lat = wgs84_to_gcj02(request.lon, request.lat)
     
-    # 🌟 读取时通过 device_id 隔离数据：只查该用户自己的店铺
     conn = sqlite3.connect("memories.db")
     cursor = conn.cursor()
     cursor.execute("SELECT DISTINCT brand, city FROM memory_pool WHERE device_id = ?", (request.device_id,))
@@ -182,16 +176,25 @@ async def discover_nearby(request: NearbyRequest):
                         raw_dist = poi.get("distance")
                         dist = int(raw_dist) if (isinstance(raw_dist, str) and raw_dist.isdigit()) else 9999
                         if dist <= 3000:
+                            # 🌟 新增：解析高德坐标并转回 WGS84 给 iOS
+                            loc_str = poi.get("location", "")
+                            poi_lon, poi_lat = 0.0, 0.0
+                            if "," in loc_str:
+                                gcj_p_lon, gcj_p_lat = map(float, loc_str.split(","))
+                                poi_lon, poi_lat = gcj02_to_wgs84(gcj_p_lon, gcj_p_lat)
+                            
                             nearby_results.append({
                                 "name": poi.get("name", ""),
                                 "address": poi.get("address", ""),
-                                "distance": str(dist)
+                                "distance": str(dist),
+                                "lat": poi_lat, # 传给前端用于打点和围栏
+                                "lon": poi_lon
                             })
         except Exception: continue
     return nearby_results
 
 @app.get("/api/memories")
-def get_all_memories(device_id: str): # 🌟 强制要求 URL 参数传入 device_id
+def get_all_memories(device_id: str):
     conn = sqlite3.connect("memories.db")
     cursor = conn.cursor()
     cursor.execute("SELECT id, brand, city, created_at, image_url FROM memory_pool WHERE device_id = ? ORDER BY id DESC", (device_id,))
@@ -200,10 +203,9 @@ def get_all_memories(device_id: str): # 🌟 强制要求 URL 参数传入 devic
     return [{"id": r[0], "brand": r[1], "city": r[2], "created_at": r[3], "image_url": r[4]} for r in rows]
 
 @app.delete("/api/memories/{memory_id}")
-def delete_memory(memory_id: int, device_id: str): # 🌟 权限校验，防止越权删除
+def delete_memory(memory_id: int, device_id: str):
     conn = sqlite3.connect("memories.db")
     cursor = conn.cursor()
-    # 必须 ID 和 device_id 同时匹配才能删除
     cursor.execute("DELETE FROM memory_pool WHERE id = ? AND device_id = ?", (memory_id, device_id))
     conn.commit()
     conn.close()
