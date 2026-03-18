@@ -14,7 +14,6 @@ from datetime import datetime
 
 app = FastAPI()
 
-# 开启跨域，确保 iOS 端访问顺畅
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,11 +22,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 挂载存储文件夹
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
-# 🔑 你的 API Key
 QWEN_API_KEY = "sk-caff47c35d20412c9561042bcbd14641"
 AMAP_KEY = "2241cf1577bb0f2893404b727066270d"
 
@@ -43,43 +40,49 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
+    
+    # 🌟 核心升级：数据库字段热迁移，兼容已有数据表
+    cursor.execute("PRAGMA table_info(memory_pool)")
+    columns = [info[1] for info in cursor.fetchall()]
+    if "device_id" not in columns:
+        print("🔧 检测到旧版数据库，正在追加 device_id 字段...")
+        # 已有数据的默认设备号设为 'anonymous'
+        cursor.execute("ALTER TABLE memory_pool ADD COLUMN device_id TEXT DEFAULT 'anonymous'")
+        
     conn.commit()
     conn.close()
 
 init_db()
 
+# 🌟 Pydantic 模型升级：强制要求提供 device_id
 class UploadRequest(BaseModel):
     image_base64: str
+    device_id: str
 
 class NearbyRequest(BaseModel):
     lat: float
     lon: float
+    device_id: str
 
-# 🌟 核心修复：WGS84 转 GCJ02 算法常量及函数
 pi = 3.1415926535897932384626
 a = 6378245.0
 ee = 0.00669342162296594323
 
 def wgs84_to_gcj02(lng, lat):
-    """将 iOS 的 WGS-84 坐标转换为高德的 GCJ-02 坐标"""
-    # 粗略判断是否在国内，不在国内则不转换
     if not (72.004 <= lng <= 137.8347 and 0.8293 <= lat <= 55.8271):
         return lng, lat
-        
     def transform_lat(lng, lat):
         ret = -100.0 + 2.0 * lng + 3.0 * lat + 0.2 * lat * lat + 0.1 * lng * lat + 0.2 * math.sqrt(abs(lng))
         ret += (20.0 * math.sin(6.0 * lng * pi) + 20.0 * math.sin(2.0 * lng * pi)) * 2.0 / 3.0
         ret += (20.0 * math.sin(lat * pi) + 40.0 * math.sin(lat / 3.0 * pi)) * 2.0 / 3.0
         ret += (160.0 * math.sin(lat / 12.0 * pi) + 320 * math.sin(lat * pi / 30.0)) * 2.0 / 3.0
         return ret
-
     def transform_lng(lng, lat):
         ret = 300.0 + lng + 2.0 * lat + 0.1 * lng * lng + 0.1 * lng * lat + 0.1 * math.sqrt(abs(lng))
         ret += (20.0 * math.sin(6.0 * lng * pi) + 20.0 * math.sin(2.0 * lng * pi)) * 2.0 / 3.0
         ret += (20.0 * math.sin(lng * pi) + 40.0 * math.sin(lng / 3.0 * pi)) * 2.0 / 3.0
         ret += (150.0 * math.sin(lng / 12.0 * pi) + 300.0 * math.sin(lng / 30.0 * pi)) * 2.0 / 3.0
         return ret
-
     dlat = transform_lat(lng - 105.0, lat - 35.0)
     dlng = transform_lng(lng - 105.0, lat - 35.0)
     radlat = lat / 180.0 * pi
@@ -88,26 +91,16 @@ def wgs84_to_gcj02(lng, lat):
     sqrtmagic = math.sqrt(magic)
     dlat = (dlat * 180.0) / ((a * (1 - ee)) / (magic * sqrtmagic) * pi)
     dlng = (dlng * 180.0) / (a / sqrtmagic * math.cos(radlat) * pi)
-    
     return lng + dlng, lat + dlat
-
-def calculate_haversine_distance(lon1, lat1, lon2, lat2):
-    lon1, lat1, lon2, lat2 = map(math.radians, [float(lon1), float(lat1), float(lon2), float(lat2)])
-    dlon = lon2 - lon1
-    dlat = lat2 - lat1
-    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
-    c = 2 * math.asin(math.sqrt(a))
-    return int(c * 6371000)
 
 @app.post("/api/upload")
 async def upload_memory(request_data: UploadRequest, request: Request):
-    print(">>> 收到新截图，正在请求 AI 解析...")
+    print(f">>> 收到用户 [{request_data.device_id}] 的新截图...")
     client = OpenAI(api_key=QWEN_API_KEY, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
     
     system_prompt = """
     你是一个精准的商业实体提取引擎。提取截图中的【核心品牌名】（brand）和城市（city）。
     ⚠️ 核心规则：只提取最核心的招牌名字！绝对不要带上菜系、分店名或标点符号后缀。
-    例如：看到“鸟喆·烧鸟·炉端烧”，只提取“鸟喆”；看到“海底捞火锅(南京路店)”，只提取“海底捞”。
     必须以 JSON 返回，示例：{"brand": "鸟喆", "city": "上海"}。
     """
     try:
@@ -140,10 +133,11 @@ async def upload_memory(request_data: UploadRequest, request: Request):
     except Exception as e:
         image_url = ""
 
+    # 🌟 写入时绑定 device_id
     conn = sqlite3.connect("memories.db")
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO memory_pool (brand, city, image_url, created_at) VALUES (?, ?, ?, ?)", 
-                   (brand_name, city_hint, image_url, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    cursor.execute("INSERT INTO memory_pool (brand, city, image_url, created_at, device_id) VALUES (?, ?, ?, ?, ?)", 
+                   (brand_name, city_hint, image_url, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), request_data.device_id))
     conn.commit()
     conn.close()
     
@@ -151,24 +145,19 @@ async def upload_memory(request_data: UploadRequest, request: Request):
 
 @app.post("/api/nearby")
 async def discover_nearby(request: NearbyRequest):
-    print(f"📍 [周边雷达] 接收到原始 WGS-84 坐标 - 纬度(lat): {request.lat}, 经度(lon): {request.lon}")
-    
     if request.lat == 0.0 and request.lon == 0.0:
-        print("⚠️ 警告：接收到无效坐标 (0.0, 0.0)，已拦截对高德 API 的无效调用")
         return []
 
-    # 🌟 关键动作：执行坐标系转换
     gcj_lon, gcj_lat = wgs84_to_gcj02(request.lon, request.lat)
-    print(f"🌐 [周边雷达] 转换后的 GCJ-02 坐标 - 纬度(lat): {gcj_lat}, 经度(lon): {gcj_lon}")
-
+    
+    # 🌟 读取时通过 device_id 隔离数据：只查该用户自己的店铺
     conn = sqlite3.connect("memories.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT brand, city FROM memory_pool")
+    cursor.execute("SELECT DISTINCT brand, city FROM memory_pool WHERE device_id = ?", (request.device_id,))
     saved_memories = cursor.fetchall()
     conn.close()
 
     if not saved_memories: 
-        print("ℹ️ 数据库中无胶囊记忆，跳过扫描")
         return []
 
     amap_url = "https://restapi.amap.com/v3/place/around"
@@ -178,7 +167,6 @@ async def discover_nearby(request: NearbyRequest):
         params = {
             "key": AMAP_KEY, 
             "keywords": brand_name,
-            # 🌟 传入转换后的高德专属坐标
             "location": f"{gcj_lon},{gcj_lat}",
             "radius": "3000",
             "sortrule": "distance"
@@ -199,27 +187,24 @@ async def discover_nearby(request: NearbyRequest):
                                 "address": poi.get("address", ""),
                                 "distance": str(dist)
                             })
-        except Exception as e: 
-            print(f"❌ 请求高德 API 发生异常: {e}")
-            continue
-            
-    print(f"✅ 扫描完成，找到 {len(nearby_results)} 家匹配店铺")
+        except Exception: continue
     return nearby_results
 
 @app.get("/api/memories")
-def get_all_memories():
+def get_all_memories(device_id: str): # 🌟 强制要求 URL 参数传入 device_id
     conn = sqlite3.connect("memories.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT id, brand, city, created_at, image_url FROM memory_pool ORDER BY id DESC")
+    cursor.execute("SELECT id, brand, city, created_at, image_url FROM memory_pool WHERE device_id = ? ORDER BY id DESC", (device_id,))
     rows = cursor.fetchall()
     conn.close()
     return [{"id": r[0], "brand": r[1], "city": r[2], "created_at": r[3], "image_url": r[4]} for r in rows]
 
 @app.delete("/api/memories/{memory_id}")
-def delete_memory(memory_id: int):
+def delete_memory(memory_id: int, device_id: str): # 🌟 权限校验，防止越权删除
     conn = sqlite3.connect("memories.db")
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM memory_pool WHERE id = ?", (memory_id,))
+    # 必须 ID 和 device_id 同时匹配才能删除
+    cursor.execute("DELETE FROM memory_pool WHERE id = ? AND device_id = ?", (memory_id, device_id))
     conn.commit()
     conn.close()
     return {"status": "success"}
