@@ -6,6 +6,7 @@ import json
 import math
 import httpx
 import asyncio
+import re # 🌟 新增正则表达式，用于清理品牌名
 from typing import Optional
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -59,6 +60,10 @@ init_db()
 class UploadRequest(BaseModel):
     image_base64: Optional[str] = ""
     text_content: Optional[str] = ""
+    # 🌟 极速通道参数：供下拉列表点选时使用
+    exact_name: Optional[str] = ""
+    exact_location: Optional[str] = "" # 高德返回的 "lng,lat"
+    exact_district: Optional[str] = ""
     device_id: str
     lat: float 
     lon: float
@@ -109,82 +114,122 @@ def calculate_haversine_distance(lon1, lat1, lon2, lat2):
     c = 2 * math.asin(math.sqrt(a))
     return int(c * 6371000)
 
+# 🌟 核心突破：数据清洗，切掉分店名，只保留核心品牌
+def extract_core_brand(name: str):
+    if not name: return ""
+    # 按括号、空格、中划线等切分，取第一段
+    core = re.split(r'\(|（|·|-| ', name)[0].strip()
+    return core
+
+# 🌟 新增路由：供前端下拉列表实时联想
+@app.get("/api/tips")
+async def get_input_tips(keyword: str, lat: float, lon: float):
+    if not keyword: return []
+    gcj_lon, gcj_lat = wgs84_to_gcj02(lon, lat)
+    url = "https://restapi.amap.com/v3/assistant/inputtips"
+    params = {
+        "key": AMAP_KEY,
+        "keywords": keyword,
+        "location": f"{gcj_lon},{gcj_lat}",
+        "datatype": "all"
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            res = (await client.get(url, params=params)).json()
+            if res.get("status") == "1":
+                # 只返回有具体坐标的结果
+                return [tip for tip in res.get("tips", []) if tip.get("location") and len(tip.get("location", "")) > 5]
+            return []
+    except Exception:
+        return []
+
 @app.post("/api/upload")
 async def upload_memory(request_data: UploadRequest, request: Request):
-    client = AsyncOpenAI(api_key=QWEN_API_KEY, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
     
-    system_prompt = """
-    你是一个精准的位置实体提取引擎。请从用户的截图或模糊文本中提取【核心品牌名/地点名】（brand）和【城市】（city）。
-    ⚠️ 规则：
-    1. 如果是截图，提取招牌核心名字。
-    2. 如果是用户输入的模糊描述（例如："五角场那家网红贝果"），请提取出最适合在地图上搜索的关键字（"网红贝果"），城市提取为"上海"（如果能推断出的话，否则填空）。
-    必须以 JSON 返回，示例：{"brand": "鸟喆", "city": "上海"}。
-    """
-    
-    messages = [{"role": "system", "content": system_prompt}]
-    if request_data.text_content:
-        messages.append({"role": "user", "content": f"提取此文本中的地点：{request_data.text_content}"})
-    elif request_data.image_base64:
-        messages.append({"role": "user", "content": [
-            {"type": "text", "text": "提取图片中的核心商户及城市。"},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{request_data.image_base64}"}}
-        ]})
-    else:
-        raise HTTPException(status_code=400, detail="Must provide text or image")
-
-    try:
-        response = await client.chat.completions.create(
-            model="qwen-vl-max" if request_data.image_base64 else "qwen-max",
-            messages=messages,
-            response_format={"type": "json_object"}
-        )
-        result_json = json.loads(response.choices[0].message.content)
-        brand_name = result_json.get("brand")
-        city_hint = result_json.get("city", "")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="AI 解析失败")
-
+    brand_name = ""
+    city_hint = ""
     poi_lat, poi_lon = 0.0, 0.0
-    upload_gcj_lon, upload_gcj_lat = wgs84_to_gcj02(request_data.lon, request_data.lat)
-    
-    amap_url = "https://restapi.amap.com/v3/place/text"
-    params = {
-        "key": AMAP_KEY, 
-        "keywords": brand_name,
-        "city": city_hint,
-        "location": f"{upload_gcj_lon},{upload_gcj_lat}" 
-    }
-    
-    try:
-        async with httpx.AsyncClient() as http_client:
-            search_res = (await http_client.get(amap_url, params=params)).json()
-            
-        if search_res.get("status") == "1" and search_res.get("pois"):
-            poi = search_res["pois"][0] 
-            loc_str = poi.get("location", "")
-            brand_name = poi.get("name", brand_name) 
-            if "," in loc_str:
-                gcj_p_lon, gcj_p_lat = map(float, loc_str.split(","))
-                poi_lon, poi_lat = gcj02_to_wgs84(gcj_p_lon, gcj_p_lat)
-    except Exception: pass
-
     image_url = ""
-    if request_data.image_base64:
+    
+    # 🌟 极速通道：用户在下拉列表中点选了具体地点，耗时瞬间降为 0.1s
+    if request_data.exact_name and request_data.exact_location:
+        brand_name = request_data.exact_name
+        city_hint = request_data.exact_district or ""
+        gcj_p_lon, gcj_p_lat = map(float, request_data.exact_location.split(","))
+        poi_lon, poi_lat = gcj02_to_wgs84(gcj_p_lon, gcj_p_lat)
+        print(f"⚡️ 触发极速通道，跳过 AI 解析：{brand_name}")
+        
+    else:
+        # 慢速通道：图像解析或模糊语义推测（需要调用大模型）
+        client = AsyncOpenAI(api_key=QWEN_API_KEY, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+        system_prompt = """
+        你是一个精准的位置实体提取引擎。请从用户的截图或模糊文本中提取【核心品牌名/地点名】（brand）和【城市】（city）。
+        ⚠️ 规则：
+        1. 如果是截图，提取招牌核心名字。
+        2. 仅提取核心品牌，不要带菜系或分店名。
+        必须以 JSON 返回，示例：{"brand": "鸟喆", "city": "上海"}。
+        """
+        
+        messages = [{"role": "system", "content": system_prompt}]
+        if request_data.text_content:
+            messages.append({"role": "user", "content": f"提取此文本中的地点：{request_data.text_content}"})
+        elif request_data.image_base64:
+            messages.append({"role": "user", "content": [
+                {"type": "text", "text": "提取图片中的核心商户及城市。"},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{request_data.image_base64}"}}
+            ]})
+        else:
+            raise HTTPException(status_code=400, detail="Must provide text or image")
+
         try:
-            image_data = base64.b64decode(request_data.image_base64)
-            filename = f"{uuid.uuid4().hex}.jpg"
-            filepath = os.path.join("uploads", filename)
-            with open(filepath, "wb") as f: f.write(image_data)
-            base_url = str(request.base_url).rstrip('/')
-            image_url = f"{base_url}/uploads/{filename}"
+            response = await client.chat.completions.create(
+                model="qwen-vl-max" if request_data.image_base64 else "qwen-max",
+                messages=messages,
+                response_format={"type": "json_object"}
+            )
+            result_json = json.loads(response.choices[0].message.content)
+            brand_name = result_json.get("brand")
+            city_hint = result_json.get("city", "")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="AI 解析失败")
+
+        # 拿着大模型提取的名字去找高德要坐标
+        upload_gcj_lon, upload_gcj_lat = wgs84_to_gcj02(request_data.lon, request_data.lat)
+        amap_url = "https://restapi.amap.com/v3/place/text"
+        params = {"key": AMAP_KEY, "keywords": brand_name, "city": city_hint, "location": f"{upload_gcj_lon},{upload_gcj_lat}"}
+        
+        try:
+            async with httpx.AsyncClient() as http_client:
+                search_res = (await http_client.get(amap_url, params=params)).json()
+                
+            if search_res.get("status") == "1" and search_res.get("pois"):
+                poi = search_res["pois"][0] 
+                loc_str = poi.get("location", "")
+                if "," in loc_str:
+                    gcj_p_lon, gcj_p_lat = map(float, loc_str.split(","))
+                    poi_lon, poi_lat = gcj02_to_wgs84(gcj_p_lon, gcj_p_lat)
         except Exception: pass
+
+        if request_data.image_base64:
+            try:
+                image_data = base64.b64decode(request_data.image_base64)
+                filename = f"{uuid.uuid4().hex}.jpg"
+                filepath = os.path.join("uploads", filename)
+                with open(filepath, "wb") as f: f.write(image_data)
+                base_url = str(request.base_url).rstrip('/')
+                image_url = f"{base_url}/uploads/{filename}"
+            except Exception: pass
+
+    # 🌟 终极清洗：不论是极速通道还是 AI 通道，存入 DB 的 brand 必须干净无污染！
+    clean_brand = extract_core_brand(brand_name)
+    if not clean_brand: clean_brand = brand_name
 
     conn = sqlite3.connect("memories.db", timeout=10)
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO memory_pool (brand, city, image_url, created_at, device_id, poi_lat, poi_lon) 
         VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (brand_name, city_hint, image_url, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), request_data.device_id, poi_lat, poi_lon))
+    """, (clean_brand, city_hint, image_url, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), request_data.device_id, poi_lat, poi_lon))
     conn.commit()
     conn.close()
     
@@ -194,7 +239,7 @@ async def upload_memory(request_data: UploadRequest, request: Request):
     
     return {
         "status": "success", 
-        "message": brand_name,
+        "message": clean_brand, # 弹窗显示干净的名字
         "poi_lat": poi_lat, 
         "poi_lon": poi_lon,
         "is_immediate_nearby": (dist_to_upload <= 500)
@@ -206,11 +251,9 @@ async def discover_nearby(request: NearbyRequest):
 
     conn = sqlite3.connect("memories.db", timeout=10)
     cursor = conn.cursor()
-    
     cursor.execute("SELECT DISTINCT brand FROM memory_pool WHERE device_id = ?", (request.device_id,))
     my_brands = [row[0] for row in cursor.fetchall()]
     
-    # 🌟 自动盲盒生成机制：只要全网有 >=20 个不同设备收藏了同一个坐标，自动向全网广播
     cursor.execute("""
         SELECT brand, poi_lat, poi_lon, COUNT(DISTINCT device_id) as wish_count 
         FROM memory_pool 
@@ -248,7 +291,7 @@ async def discover_nearby(request: NearbyRequest):
                             gcj_p_lon, gcj_p_lat = map(float, loc_str.split(","))
                             poi_lon, poi_lat = gcj02_to_wgs84(gcj_p_lon, gcj_p_lat)
                         nearby_results.append({
-                            "brand": brand_name, # 🌟 核心：返回品牌基名，供前端合并折叠
+                            "brand": brand_name, 
                             "name": poi.get("name", ""),
                             "address": poi.get("address", ""),
                             "distance": str(dist),
