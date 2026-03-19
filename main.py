@@ -31,9 +31,6 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 QWEN_API_KEY = "sk-caff47c35d20412c9561042bcbd14641"
 AMAP_KEY = "2241cf1577bb0f2893404b727066270d"
 
-# ==========================================
-# 🌟 后端修改 1：数据库 schema 升级
-# ==========================================
 def init_db():
     conn = sqlite3.connect("memories.db", timeout=10)
     cursor = conn.cursor()
@@ -47,17 +44,14 @@ def init_db():
             created_at TEXT NOT NULL,
             device_id TEXT DEFAULT 'anonymous',
             poi_lat REAL DEFAULT 0.0,
-            poi_lon REAL DEFAULT 0.0,
-            is_visited INTEGER DEFAULT 0 -- 🌟 0: 待去, 1: 已点亮
+            poi_lon REAL DEFAULT 0.0
         )
     """)
-    
-    # 🌟 检查并升级旧数据库，防止增加列后报错
     cursor.execute("PRAGMA table_info(memory_pool)")
     columns = [info[1] for info in cursor.fetchall()]
-    if "is_visited" not in columns:
-        cursor.execute("ALTER TABLE memory_pool ADD COLUMN is_visited INTEGER DEFAULT 0")
-        
+    if "poi_lat" not in columns:
+        cursor.execute("ALTER TABLE memory_pool ADD COLUMN poi_lat REAL DEFAULT 0.0")
+        cursor.execute("ALTER TABLE memory_pool ADD COLUMN poi_lon REAL DEFAULT 0.0")
     conn.commit()
     conn.close()
 
@@ -76,10 +70,6 @@ class UploadRequest(BaseModel):
 class NearbyRequest(BaseModel):
     lat: float
     lon: float
-    device_id: str
-
-# 🌟 后端修改 2：新增打卡（点亮）请求模型
-class CheckinRequest(BaseModel):
     device_id: str
 
 pi = 3.1415926535897932384626
@@ -193,7 +183,7 @@ async def upload_memory(request_data: UploadRequest, request: Request):
     clean_brand = extract_core_brand(brand_name) or brand_name
     conn = sqlite3.connect("memories.db", timeout=10)
     cursor = conn.cursor()
-    cursor.execute("""INSERT INTO memory_pool (brand, city, image_url, created_at, device_id, poi_lat, poi_lon, is_visited) VALUES (?, ?, ?, ?, ?, ?, ?, 0)""", (clean_brand, city_hint, image_url, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), request_data.device_id, poi_lat, poi_lon))
+    cursor.execute("""INSERT INTO memory_pool (brand, city, image_url, created_at, device_id, poi_lat, poi_lon) VALUES (?, ?, ?, ?, ?, ?, ?)""", (clean_brand, city_hint, image_url, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), request_data.device_id, poi_lat, poi_lon))
     conn.commit()
     conn.close()
     
@@ -207,13 +197,12 @@ async def discover_nearby(request: NearbyRequest):
     if request.lat == 0.0 and request.lon == 0.0: return []
     conn = sqlite3.connect("memories.db", timeout=10)
     cursor = conn.cursor()
-    # 🌟 后端修改 3：雷达只查询 "待去" (is_visited=0) 的坐标
-    cursor.execute("SELECT DISTINCT brand FROM memory_pool WHERE device_id = ? AND is_visited = 0", (request.device_id,))
+    cursor.execute("SELECT DISTINCT brand FROM memory_pool WHERE device_id = ?", (request.device_id,))
     my_brands = [row[0] for row in cursor.fetchall()]
     cursor.execute("""
         SELECT brand, poi_lat, poi_lon, COUNT(DISTINCT device_id) as wish_count 
         FROM memory_pool 
-        WHERE device_id != ? AND poi_lat != 0.0 AND is_visited = 0
+        WHERE device_id != ? AND poi_lat != 0.0
         GROUP BY brand, poi_lat, poi_lon HAVING wish_count >= 20
     """, (request.device_id,))
     public_boxes = cursor.fetchall()
@@ -254,24 +243,10 @@ async def discover_nearby(request: NearbyRequest):
 def get_all_memories(device_id: str):
     conn = sqlite3.connect("memories.db", timeout=10)
     cursor = conn.cursor()
-    # 🌟 后端修改 4：足迹列表也要返回 is_visited 状态
-    cursor.execute("SELECT id, brand, city, created_at, image_url, is_visited FROM memory_pool WHERE device_id = ? ORDER BY created_at DESC", (device_id,))
+    cursor.execute("SELECT id, brand, city, created_at, image_url FROM memory_pool WHERE device_id = ? ORDER BY created_at DESC", (device_id,))
     rows = cursor.fetchall()
     conn.close()
-    return [{"id": r[0], "brand": r[1], "city": r[2], "created_at": r[3], "image_url": r[4], "is_visited": bool(r[5])} for r in rows]
-
-# 🌟 后端修改 5：新增“打卡（点亮）”接口，不再是左滑删除
-@app.post("/api/memories/{memory_id}/checkin")
-def checkin_memory(memory_id: int, request_data: CheckinRequest):
-    conn = sqlite3.connect("memories.db", timeout=10)
-    cursor = conn.cursor()
-    # 🌟 将状态从待去改为已点亮 (is_visited=1)
-    cursor.execute("UPDATE memory_pool SET is_visited = 1 WHERE id = ? AND device_id = ?", (memory_id, request_data.device_id))
-    affected_rows = cursor.rowcount
-    conn.commit()
-    conn.close()
-    if affected_rows == 0: raise HTTPException(status_code=404, detail="Memory not found")
-    return {"status": "success", "message": "Memory checked-in"}
+    return [{"id": r[0], "brand": r[1], "city": r[2], "created_at": r[3], "image_url": r[4]} for r in rows]
 
 @app.delete("/api/memories/{memory_id}")
 def delete_memory(memory_id: int, device_id: str):
