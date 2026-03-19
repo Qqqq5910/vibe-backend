@@ -31,18 +31,13 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 QWEN_API_KEY = "sk-caff47c35d20412c9561042bcbd14641"
 AMAP_KEY = "2241cf1577bb0f2893404b727066270d"
 
-# 🌟 冷启动动态阈值配置（当前调至 2 人即可触发社交盲盒）
+# 冷启动动态阈值配置
 BLIND_BOX_THRESHOLD = 2 
 
-# ==========================================
-# 数据库 Schema 初始化
-# ==========================================
 def init_db():
     conn = sqlite3.connect("memories.db", timeout=10)
     cursor = conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL;")
-    
-    # 核心胶囊池表（已剥离 is_visited 字段，回归纯粹删除逻辑）
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS memory_pool (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,8 +50,6 @@ def init_db():
             poi_lon REAL DEFAULT 0.0
         )
     """)
-    
-    # 用户权限与配额表
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS user_profiles (
             device_id TEXT PRIMARY KEY,
@@ -65,15 +58,11 @@ def init_db():
             ai_usage_count INTEGER DEFAULT 0
         )
     """)
-    
     conn.commit()
     conn.close()
 
 init_db()
 
-# ==========================================
-# 请求模型定义
-# ==========================================
 class UploadRequest(BaseModel):
     image_base64: Optional[str] = ""
     text_content: Optional[str] = ""
@@ -92,9 +81,6 @@ class NearbyRequest(BaseModel):
 class UpgradeRequest(BaseModel):
     device_id: str
 
-# ==========================================
-# 工具函数
-# ==========================================
 pi = 3.1415926535897932384626
 a = 6378245.0
 ee = 0.00669342162296594323
@@ -139,18 +125,12 @@ def extract_core_brand(name: str):
     if not name: return ""
     return re.split(r'\(|（|·|-| ', name)[0].strip()
 
-# ==========================================
-# 🌟 核心拦截组件：配额与权限校验
-# ==========================================
 def check_quota(device_id: str, is_ai_request: bool):
     conn = sqlite3.connect("memories.db", timeout=10)
     cursor = conn.cursor()
-    
     cursor.execute("SELECT is_pro, ai_usage_month, ai_usage_count FROM user_profiles WHERE device_id = ?", (device_id,))
     user = cursor.fetchone()
     current_month = datetime.now().strftime("%Y-%m")
-    
-    # 初始化新用户配置
     if not user:
         cursor.execute("INSERT INTO user_profiles (device_id, is_pro, ai_usage_month, ai_usage_count) VALUES (?, 0, ?, 0)", (device_id, current_month))
         is_pro, ai_month, ai_count = False, current_month, 0
@@ -158,37 +138,21 @@ def check_quota(device_id: str, is_ai_request: bool):
         is_pro = bool(user[0])
         ai_month = user[1]
         ai_count = user[2]
-        
-        # 自然月跨月，重置 AI 免费额度
         if ai_month != current_month:
-            ai_month = current_month
-            ai_count = 0
+            ai_month = current_month; ai_count = 0
             cursor.execute("UPDATE user_profiles SET ai_usage_month = ?, ai_usage_count = 0 WHERE device_id = ?", (current_month, device_id))
-            
-    # 限制 1：普通用户存储上限拦截 (30 个)
     if not is_pro:
         cursor.execute("SELECT COUNT(*) FROM memory_pool WHERE device_id = ?", (device_id,))
-        total_capsules = cursor.fetchone()[0]
-        if total_capsules >= 30:
-            conn.close()
-            return False, "CAPSULE_LIMIT_REACHED"
-
-    # 限制 2：AI 处理请求频次拦截
+        if cursor.fetchone()[0] >= 30:
+            conn.close(); return False, "CAPSULE_LIMIT_REACHED"
     if is_ai_request:
-        max_ai = 100 if is_pro else 10
-        if ai_count >= max_ai:
-            conn.close()
-            return False, "AI_LIMIT_REACHED"
-            
+        if ai_count >= (100 if is_pro else 10):
+            conn.close(); return False, "AI_LIMIT_REACHED"
         cursor.execute("UPDATE user_profiles SET ai_usage_count = ai_usage_count + 1 WHERE device_id = ?", (device_id,))
-        
     conn.commit()
     conn.close()
     return True, ""
 
-# ==========================================
-# API 路由
-# ==========================================
 @app.get("/api/tips")
 async def get_input_tips(keyword: str, lat: float, lon: float):
     if not keyword: return []
@@ -198,32 +162,27 @@ async def get_input_tips(keyword: str, lat: float, lon: float):
     try:
         async with httpx.AsyncClient() as client:
             res = (await client.get(url, params=params)).json()
-            if res.get("status") == "1":
-                return [tip for tip in res.get("tips", []) if tip.get("location") and len(tip.get("location", "")) > 5]
+            if res.get("status") == "1": return [tip for tip in res.get("tips", []) if tip.get("location") and len(tip.get("location", "")) > 5]
             return []
     except Exception: return []
 
 @app.post("/api/upload")
 async def upload_memory(request_data: UploadRequest, request: Request):
-    # 优先校验 Freemium 配额模型
-    is_ai_request = bool(request_data.image_base64)
+    is_ai_request = bool(request_data.image_base64) or bool(request_data.text_content)
     can_proceed, reason = check_quota(request_data.device_id, is_ai_request)
-    
-    if not can_proceed:
-        raise HTTPException(status_code=403, detail=reason)
+    if not can_proceed: raise HTTPException(status_code=403, detail=reason)
 
     brand_name = ""; city_hint = ""; poi_lat = 0.0; poi_lon = 0.0; image_url = ""
     
-    # 极速通道：高德联想精确匹配
     if request_data.exact_name and request_data.exact_location:
         brand_name = request_data.exact_name
         city_hint = request_data.exact_district or ""
         gcj_p_lon, gcj_p_lat = map(float, request_data.exact_location.split(","))
         poi_lon, poi_lat = gcj02_to_wgs84(gcj_p_lon, gcj_p_lat)
-    # 慢速通道：大模型视觉与文本解析
     else:
         client = AsyncOpenAI(api_key=QWEN_API_KEY, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
-        system_prompt = """你是一个精准的位置实体提取引擎。请提取用户的截图或模糊文本中的【核心品牌名】（brand）和【城市】（city）。JSON 返回。"""
+        # 🌟 优化 Prompt，让它更懂纯文本处理
+        system_prompt = """你是一个精准的位置实体提取引擎。请提取用户的截图或模糊文本中的【核心品牌名】（brand）和【城市】（city）。如果是纯文本描述且未明确指明城市，city字段请留空。JSON 返回。"""
         messages = [{"role": "system", "content": system_prompt}]
         if request_data.text_content: messages.append({"role": "user", "content": f"提取此文本：{request_data.text_content}"})
         elif request_data.image_base64: messages.append({"role": "user", "content": [
@@ -238,6 +197,7 @@ async def upload_memory(request_data: UploadRequest, request: Request):
             city_hint = result_json.get("city", "")
         except Exception: raise HTTPException(status_code=500, detail="AI 解析失败")
         
+        # 高德 API 天然优先基于传入的 lat/lon (用户当前位置) 返回周边结果
         upload_gcj_lon, upload_gcj_lat = wgs84_to_gcj02(request_data.lon, request_data.lat)
         amap_url = "https://restapi.amap.com/v3/place/text"
         params = {"key": AMAP_KEY, "keywords": brand_name, "city": city_hint, "location": f"{upload_gcj_lon},{upload_gcj_lat}"}
@@ -259,7 +219,6 @@ async def upload_memory(request_data: UploadRequest, request: Request):
                 image_url = f"{str(request.base_url).rstrip('/')}/uploads/{filename}"
             except Exception: pass
 
-    # 数据落库
     clean_brand = extract_core_brand(brand_name) or brand_name
     conn = sqlite3.connect("memories.db", timeout=10)
     cursor = conn.cursor()
@@ -267,7 +226,6 @@ async def upload_memory(request_data: UploadRequest, request: Request):
     conn.commit()
     conn.close()
     
-    # 判断是否为附近即时触发
     dist_to_upload = 9999
     if poi_lat != 0.0: dist_to_upload = calculate_haversine_distance(request_data.lon, request_data.lat, poi_lon, poi_lat)
     return {"status": "success", "message": clean_brand, "poi_lat": poi_lat, "poi_lon": poi_lon, "is_immediate_nearby": (dist_to_upload <= 500)}
@@ -275,14 +233,10 @@ async def upload_memory(request_data: UploadRequest, request: Request):
 @app.post("/api/nearby")
 async def discover_nearby(request: NearbyRequest):
     if request.lat == 0.0 and request.lon == 0.0: return []
-    
     conn = sqlite3.connect("memories.db", timeout=10)
     cursor = conn.cursor()
-    
     cursor.execute("SELECT DISTINCT brand FROM memory_pool WHERE device_id = ?", (request.device_id,))
     my_brands = [row[0] for row in cursor.fetchall()]
-    
-    # 🌟 动态盲盒触发机制：应用全局变量 BLIND_BOX_THRESHOLD
     cursor.execute("""
         SELECT brand, poi_lat, poi_lon, COUNT(DISTINCT device_id) as wish_count 
         FROM memory_pool 
@@ -290,14 +244,12 @@ async def discover_nearby(request: NearbyRequest):
         GROUP BY brand, poi_lat, poi_lon 
         HAVING wish_count >= ?
     """, (request.device_id, BLIND_BOX_THRESHOLD))
-    
     public_boxes = cursor.fetchall()
     conn.close()
     
     gcj_lon, gcj_lat = wgs84_to_gcj02(request.lon, request.lat)
     amap_url = "https://restapi.amap.com/v3/place/around"
     nearby_results = []
-    
     async def fetch_brand_nearby(client, brand_name):
         params = {"key": AMAP_KEY, "keywords": brand_name, "location": f"{gcj_lon},{gcj_lat}", "radius": "3000", "sortrule": "distance"}
         try: res = await client.get(amap_url, params=params); return brand_name, res.json()
@@ -323,12 +275,10 @@ async def discover_nearby(request: NearbyRequest):
         dist = calculate_haversine_distance(request.lon, request.lat, p_lon, p_lat)
         if dist <= 3000: nearby_results.append({"brand": p_brand, "name": f"神秘盲盒：{p_brand}", "address": "周边高人气打卡地", "distance": str(dist), "lat": p_lat, "lon": p_lon, "is_public": True, "wish_count": w_count})
         
-    unique_results = []
-    seen = set()
+    unique_results = []; seen = set()
     for item in sorted(nearby_results, key=lambda x: int(x["distance"])):
         identifier = f"{item['name']}_{item['lat']}_{item['lon']}"
         if identifier not in seen: seen.add(identifier); unique_results.append(item)
-        
     return unique_results
 
 @app.get("/api/memories")
@@ -349,9 +299,6 @@ def delete_memory(memory_id: int, device_id: str):
     conn.close()
     return {"status": "success"}
 
-# ==========================================
-# 🌟 支付核销接口：为终端设备授权 Pro
-# ==========================================
 @app.post("/api/upgrade")
 def upgrade_to_pro(request_data: UpgradeRequest):
     conn = sqlite3.connect("memories.db", timeout=10)
