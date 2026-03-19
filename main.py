@@ -43,8 +43,7 @@ def init_db():
             created_at TEXT NOT NULL,
             device_id TEXT DEFAULT 'anonymous',
             poi_lat REAL DEFAULT 0.0,
-            poi_lon REAL DEFAULT 0.0,
-            is_public INTEGER DEFAULT 0
+            poi_lon REAL DEFAULT 0.0
         )
     """)
     cursor.execute("PRAGMA table_info(memory_pool)")
@@ -52,8 +51,6 @@ def init_db():
     if "poi_lat" not in columns:
         cursor.execute("ALTER TABLE memory_pool ADD COLUMN poi_lat REAL DEFAULT 0.0")
         cursor.execute("ALTER TABLE memory_pool ADD COLUMN poi_lon REAL DEFAULT 0.0")
-    if "is_public" not in columns:
-        cursor.execute("ALTER TABLE memory_pool ADD COLUMN is_public INTEGER DEFAULT 0")
     conn.commit()
     conn.close()
 
@@ -62,7 +59,6 @@ init_db()
 class UploadRequest(BaseModel):
     image_base64: Optional[str] = ""
     text_content: Optional[str] = ""
-    is_public: bool = False
     device_id: str
     lat: float 
     lon: float
@@ -117,7 +113,6 @@ def calculate_haversine_distance(lon1, lat1, lon2, lat2):
 async def upload_memory(request_data: UploadRequest, request: Request):
     client = AsyncOpenAI(api_key=QWEN_API_KEY, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
     
-    # 🌟 AI 提示词重构：兼顾模糊文字理解
     system_prompt = """
     你是一个精准的位置实体提取引擎。请从用户的截图或模糊文本中提取【核心品牌名/地点名】（brand）和【城市】（city）。
     ⚠️ 规则：
@@ -152,7 +147,6 @@ async def upload_memory(request_data: UploadRequest, request: Request):
     poi_lat, poi_lon = 0.0, 0.0
     upload_gcj_lon, upload_gcj_lat = wgs84_to_gcj02(request_data.lon, request_data.lat)
     
-    # 高德搜索
     amap_url = "https://restapi.amap.com/v3/place/text"
     params = {
         "key": AMAP_KEY, 
@@ -168,13 +162,12 @@ async def upload_memory(request_data: UploadRequest, request: Request):
         if search_res.get("status") == "1" and search_res.get("pois"):
             poi = search_res["pois"][0] 
             loc_str = poi.get("location", "")
-            brand_name = poi.get("name", brand_name) # 用高德的官方名字覆盖用户的模糊输入
+            brand_name = poi.get("name", brand_name) 
             if "," in loc_str:
                 gcj_p_lon, gcj_p_lat = map(float, loc_str.split(","))
                 poi_lon, poi_lat = gcj02_to_wgs84(gcj_p_lon, gcj_p_lat)
     except Exception: pass
 
-    # 保存图片（如果有）
     image_url = ""
     if request_data.image_base64:
         try:
@@ -186,13 +179,12 @@ async def upload_memory(request_data: UploadRequest, request: Request):
             image_url = f"{base_url}/uploads/{filename}"
         except Exception: pass
 
-    is_pub = 1 if request_data.is_public else 0
     conn = sqlite3.connect("memories.db", timeout=10)
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO memory_pool (brand, city, image_url, created_at, device_id, poi_lat, poi_lon, is_public) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (brand_name, city_hint, image_url, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), request_data.device_id, poi_lat, poi_lon, is_pub))
+        INSERT INTO memory_pool (brand, city, image_url, created_at, device_id, poi_lat, poi_lon) 
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (brand_name, city_hint, image_url, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), request_data.device_id, poi_lat, poi_lon))
     conn.commit()
     conn.close()
     
@@ -215,16 +207,16 @@ async def discover_nearby(request: NearbyRequest):
     conn = sqlite3.connect("memories.db", timeout=10)
     cursor = conn.cursor()
     
-    # 🌟 取出自己的所有地点
     cursor.execute("SELECT DISTINCT brand FROM memory_pool WHERE device_id = ?", (request.device_id,))
     my_brands = [row[0] for row in cursor.fetchall()]
     
-    # 🌟 取出别人公开的盲盒 (按坐标/品牌聚合，计算热度)
+    # 🌟 自动盲盒生成机制：只要全网有 >=20 个不同设备收藏了同一个坐标，自动向全网广播
     cursor.execute("""
-        SELECT brand, poi_lat, poi_lon, COUNT(*) as wish_count 
+        SELECT brand, poi_lat, poi_lon, COUNT(DISTINCT device_id) as wish_count 
         FROM memory_pool 
-        WHERE is_public = 1 AND device_id != ? AND poi_lat != 0.0
+        WHERE device_id != ? AND poi_lat != 0.0
         GROUP BY brand, poi_lat, poi_lon
+        HAVING wish_count >= 20
     """, (request.device_id,))
     public_boxes = cursor.fetchall()
     conn.close()
@@ -233,7 +225,6 @@ async def discover_nearby(request: NearbyRequest):
     amap_url = "https://restapi.amap.com/v3/place/around"
     nearby_results = []
     
-    # 1. 动态查高德：找自己的店
     async def fetch_brand_nearby(client, brand_name):
         params = {"key": AMAP_KEY, "keywords": brand_name, "location": f"{gcj_lon},{gcj_lat}", "radius": "3000", "sortrule": "distance"}
         try:
@@ -257,6 +248,7 @@ async def discover_nearby(request: NearbyRequest):
                             gcj_p_lon, gcj_p_lat = map(float, loc_str.split(","))
                             poi_lon, poi_lat = gcj02_to_wgs84(gcj_p_lon, gcj_p_lat)
                         nearby_results.append({
+                            "brand": brand_name, # 🌟 核心：返回品牌基名，供前端合并折叠
                             "name": poi.get("name", ""),
                             "address": poi.get("address", ""),
                             "distance": str(dist),
@@ -264,23 +256,21 @@ async def discover_nearby(request: NearbyRequest):
                             "is_public": False, "wish_count": 1
                         })
                         
-    # 2. 本地计算：找别人的盲盒（不用去高德查，因为存的时候坐标已经固定）
     for p_brand, p_lat, p_lon, w_count in public_boxes:
         dist = calculate_haversine_distance(request.lon, request.lat, p_lon, p_lat)
         if dist <= 3000:
             nearby_results.append({
+                "brand": p_brand,
                 "name": f"神秘盲盒：{p_brand}",
-                "address": "来自他人的公开胶囊",
+                "address": "周边高人气打卡地",
                 "distance": str(dist),
                 "lat": p_lat, "lon": p_lon,
                 "is_public": True, "wish_count": w_count
             })
             
-    # 去重并排序
     unique_results = []
     seen = set()
     for item in sorted(nearby_results, key=lambda x: int(x["distance"])):
-        # 相同名字和位置的算同一个
         identifier = f"{item['name']}_{item['lat']}_{item['lon']}"
         if identifier not in seen:
             seen.add(identifier)
@@ -292,10 +282,10 @@ async def discover_nearby(request: NearbyRequest):
 def get_all_memories(device_id: str):
     conn = sqlite3.connect("memories.db", timeout=10)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, brand, city, created_at, image_url, is_public FROM memory_pool WHERE device_id = ? ORDER BY id DESC", (device_id,))
+    cursor.execute("SELECT id, brand, city, created_at, image_url FROM memory_pool WHERE device_id = ? ORDER BY id DESC", (device_id,))
     rows = cursor.fetchall()
     conn.close()
-    return [{"id": r[0], "brand": r[1], "city": r[2], "created_at": r[3], "image_url": r[4], "is_public": bool(r[5])} for r in rows]
+    return [{"id": r[0], "brand": r[1], "city": r[2], "created_at": r[3], "image_url": r[4], "is_public": False} for r in rows]
 
 @app.delete("/api/memories/{memory_id}")
 def delete_memory(memory_id: int, device_id: str):
