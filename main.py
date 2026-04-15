@@ -1,3 +1,4 @@
+
 import os
 import uuid
 import base64
@@ -92,12 +93,14 @@ app.add_middleware(
 )
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
+
 # -----------------------------
 # Models
 # -----------------------------
 class UploadRequest(BaseModel):
     image_base64: Optional[str] = ""
     text_content: Optional[str] = ""
+    source_url: Optional[str] = ""
     exact_name: Optional[str] = ""
     exact_location: Optional[str] = ""
     exact_district: Optional[str] = ""
@@ -327,6 +330,62 @@ def safe_base64url_json_decode(jws_token: str) -> dict:
         raise HTTPException(status_code=502, detail="APPLE_JWS_DECODE_FAILED") from e
 
 
+def build_multimodal_hint(text_content: str, source_url: str) -> str:
+    parts: List[str] = [
+        "请提取这次分享里对应的商户或地点的核心品牌名与城市。",
+        "优先识别实际店名、品牌名，不要输出“探店”“收藏”“推荐”“链接”等无关词。",
+    ]
+    if text_content:
+        parts.append(f"补充文字：{text_content}")
+    if source_url:
+        parts.append(f"来源链接：{source_url}")
+    return "\n".join(parts)
+
+
+async def run_ai_extract(
+    client: AsyncOpenAI,
+    system_prompt: str,
+    *,
+    text_content: str,
+    image_base64: str,
+    source_url: str,
+    image_only_fallback: bool = False,
+) -> Tuple[str, str]:
+    messages = [{"role": "system", "content": system_prompt}]
+
+    if image_base64:
+        if image_only_fallback:
+            hint_text = "请只根据图片内容提取商户核心品牌名与城市。忽略任何模糊文案。"
+        else:
+            hint_text = build_multimodal_hint(text_content, source_url)
+
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": hint_text},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
+                ],
+            }
+        )
+        model = QWEN_MODEL_IMAGE
+    else:
+        plain_text = text_content or source_url
+        messages.append({"role": "user", "content": f"请从这段文字中提取商户核心品牌名与城市：{plain_text}"})
+        model = QWEN_MODEL_TEXT
+
+    response = await client.chat.completions.create(
+        model=model,
+        messages=messages,
+        response_format={"type": "json_object"},
+        timeout=25,
+    )
+    result_json = json.loads(response.choices[0].message.content)
+    brand_name = (result_json.get("brand") or "").strip()
+    city_hint = (result_json.get("city") or "").strip()
+    return brand_name, city_hint
+
+
 # -----------------------------
 # App Store verification helpers
 # -----------------------------
@@ -536,6 +595,7 @@ async def upload_memory(request_data: UploadRequest, request: Request):
     device_id = request_data.device_id.strip()
     text_content = (request_data.text_content or "").strip()
     image_base64 = request_data.image_base64 or ""
+    source_url = (request_data.source_url or "").strip()
     exact_name = (request_data.exact_name or "").strip()
     exact_location = (request_data.exact_location or "").strip()
     exact_district = (request_data.exact_district or "").strip()
@@ -545,7 +605,16 @@ async def upload_memory(request_data: UploadRequest, request: Request):
     if image_base64 and len(image_base64.encode("utf-8")) > int(MAX_IMAGE_BYTES * 1.45):
         raise HTTPException(status_code=413, detail="IMAGE_TOO_LARGE")
 
-    is_ai_request = bool(image_base64) or bool(text_content)
+    logger.info(
+        "upload payload summary | has_text=%s | text_len=%s | has_image=%s | has_source_url=%s | exact_name=%s",
+        bool(text_content),
+        len(text_content),
+        bool(image_base64),
+        bool(source_url),
+        bool(exact_name),
+    )
+
+    is_ai_request = bool(image_base64) or bool(text_content) or bool(source_url)
     can_proceed, reason = check_quota(device_id, is_ai_request)
     if not can_proceed:
         raise HTTPException(status_code=403, detail=reason)
@@ -561,42 +630,45 @@ async def upload_memory(request_data: UploadRequest, request: Request):
         city_hint = exact_district
         poi_lon, poi_lat = parse_location_string(exact_location)
     else:
-        if not (text_content or image_base64):
+        if not (text_content or image_base64 or source_url):
             raise HTTPException(status_code=400, detail="MUST_PROVIDE_TEXT_OR_IMAGE")
 
         client = build_openai_client()
         system_prompt = (
             "你是一个精准的位置实体提取引擎。"
-            "请提取用户的截图或模糊文本中的【核心品牌名】（brand）和【城市】（city）。"
+            "请提取用户截图、分享文案或链接语境中的【核心品牌名】（brand）和【城市】（city）。"
+            "品牌名必须尽量短，只保留真正的店名、品牌名，不要带菜系、分店、标点后缀。"
+            "如果文字很模糊，但图片里有明确店名，请优先相信图片。"
             "如果是纯文本描述且未明确指明城市，city字段请留空。"
             "只返回 JSON，如 {\"brand\":\"xxx\",\"city\":\"xxx\"}。"
         )
-        messages = [{"role": "system", "content": system_prompt}]
-        if text_content:
-            messages.append({"role": "user", "content": f"提取此文本：{text_content}"})
-        else:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "提取图片中的商户及城市。"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
-                    ],
-                }
-            )
 
         try:
-            response = await client.chat.completions.create(
-                model=QWEN_MODEL_IMAGE if image_base64 else QWEN_MODEL_TEXT,
-                messages=messages,
-                response_format={"type": "json_object"},
-                timeout=25,
+            brand_name, city_hint = await run_ai_extract(
+                client,
+                system_prompt,
+                text_content=text_content,
+                image_base64=image_base64,
+                source_url=source_url,
+                image_only_fallback=False,
             )
-            result_json = json.loads(response.choices[0].message.content)
-            brand_name = (result_json.get("brand") or "").strip()
-            city_hint = (result_json.get("city") or "").strip()
+
+            if not brand_name and image_base64 and text_content:
+                logger.info("ai extract empty on mixed input, retrying image-only fallback")
+                brand_name, city_hint = await run_ai_extract(
+                    client,
+                    system_prompt,
+                    text_content="",
+                    image_base64=image_base64,
+                    source_url="",
+                    image_only_fallback=True,
+                )
+
+            logger.info("ai extract result | brand=%s | city=%s", brand_name, city_hint)
+
             if not brand_name:
                 raise HTTPException(status_code=422, detail="AI_EXTRACT_EMPTY")
+
             increment_ai_usage(device_id)
         except HTTPException:
             raise
@@ -643,7 +715,6 @@ async def upload_memory(request_data: UploadRequest, request: Request):
                 raise
             except Exception:
                 logger.exception("Image save failed")
-                # 图片失败不阻断整个 memory 保存，维持原有容错思路
                 image_url = ""
 
     clean_brand = extract_core_brand(brand_name) or brand_name
