@@ -386,6 +386,137 @@ async def run_ai_extract(
     return brand_name, city_hint
 
 
+CITY_KEYWORDS = [
+    "上海", "北京", "广州", "深圳", "杭州", "成都", "重庆", "南京", "苏州", "武汉",
+    "西安", "长沙", "青岛", "厦门", "天津", "宁波", "郑州", "合肥", "无锡", "佛山",
+    "东莞", "昆明", "福州", "南昌", "沈阳", "大连", "哈尔滨", "长春", "济南",
+]
+
+DISTRICT_CITY_MAP = {
+    "徐家汇": "上海",
+    "陆家嘴": "上海",
+    "静安寺": "上海",
+    "南京东路": "上海",
+    "南京西路": "上海",
+    "淮海路": "上海",
+    "新天地": "上海",
+    "五角场": "上海",
+    "中山公园": "上海",
+    "前滩": "上海",
+    "环球港": "上海",
+    "百脑汇": "上海",
+    "国金中心": "上海",
+    "来福士": "上海",
+    "合生汇": "上海",
+    "K11": "上海",
+    "iapm": "上海",
+    "太古里": "成都",
+    "春熙路": "成都",
+    "天河城": "广州",
+    "万象城": "深圳",
+    "SKP": "北京",
+}
+
+LOCATION_SUFFIX_HINTS = [
+    "百脑汇", "万象城", "大悦城", "太古里", "万达", "印象城", "龙湖天街", "环球港",
+    "来福士", "合生汇", "国金中心", "徐家汇", "陆家嘴", "静安寺", "南京东路", "南京西路",
+    "淮海路", "新天地", "五角场", "中山公园", "前滩", "K11", "SKP", "iapm",
+]
+
+GENERIC_BRAND_WORDS = {
+    "狗咖", "猫咖", "咖啡", "咖啡馆", "餐厅", "酒吧", "生活记录", "citywalk", "增狗馆",
+    "毛孩子", "店员", "环境", "朋友", "大家", "上海", "北京", "广州", "深圳", "杭州", "成都",
+}
+
+
+def normalize_social_text(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = re.sub(r"https?://\S+", " ", text)
+    cleaned = re.sub(r"www\.\S+", " ", cleaned)
+    cleaned = re.sub(r"[#＃][^\s#＃]+", lambda m: f" {m.group(0)} ", cleaned)
+    cleaned = re.sub(r"[\u2600-\u27BF\U0001F300-\U0001FAFF]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def infer_city_from_social_text(text: str) -> str:
+    normalized = normalize_social_text(text)
+    for city in CITY_KEYWORDS:
+        if city in normalized:
+            return city
+    for keyword, city in DISTRICT_CITY_MAP.items():
+        if keyword in normalized:
+            return city
+    return ""
+
+
+def clean_brand_candidate(candidate: str) -> str:
+    candidate = candidate.strip(" ，。！？!?,.·~～:：/\\|[]【】()（）")
+    candidate = re.sub(r"^(打卡了?|去了|来到了|来到|安利了?|推荐了?|收藏了?|发现了?|种草了?|这家|一家|一个)+", "", candidate).strip()
+    candidate = re.sub(r"^(没有异味的|干净的|超火的|宝藏的|可爱的|幸福的|附近的|新开的)+", "", candidate).strip()
+
+    changed = True
+    while changed:
+        changed = False
+        for token in LOCATION_SUFFIX_HINTS:
+            if candidate.endswith(token) and len(candidate) > len(token) + 1:
+                candidate = candidate[:-len(token)].strip()
+                changed = True
+
+    candidate = re.sub(r"(分店|门店|旗舰店|概念店|体验店|首店)$", "", candidate).strip()
+    candidate = re.sub(r"(商圈)$", "", candidate).strip()
+    candidate = re.sub(r"(狗咖|猫咖)$", "", candidate).strip()
+    candidate = re.sub(r"\s+", " ", candidate).strip()
+
+    if not candidate:
+        return ""
+    if candidate in GENERIC_BRAND_WORDS:
+        return ""
+    if len(candidate) < 2 or len(candidate) > 18:
+        return ""
+    return candidate
+
+
+def extract_brand_from_social_text(text: str) -> str:
+    normalized = normalize_social_text(text)
+    if not normalized:
+        return ""
+
+    segments = [seg.strip() for seg in re.split(r"[\n。！？!?；;]", normalized) if seg.strip()]
+    patterns = [
+        r"([A-Za-z0-9\u4e00-\u9fa5· ]{2,24}?)\s*(?:[（(][^()（）]{1,10}[)）])?\s*店\b",
+        r"([A-Za-z0-9\u4e00-\u9fa5· ]{2,24}?)\s*(?:馆|咖啡馆|咖啡|酒吧|居酒屋|面包店|甜品店)\b",
+    ]
+
+    candidates = []
+    for seg in segments:
+        for pattern in patterns:
+            for match in re.finditer(pattern, seg):
+                raw = match.group(1)
+                cleaned = clean_brand_candidate(raw)
+                if cleaned:
+                    candidates.append(cleaned)
+
+    if candidates:
+        candidates.sort(key=lambda s: (len(s), s.count(" ")), reverse=True)
+        return candidates[0]
+
+    compact = normalized.replace(" ", "")
+    fuzzy_patterns = [
+        r"([A-Za-z0-9\u4e00-\u9fa5·]{2,20}?)(?:百脑汇|万象城|大悦城|太古里|徐家汇|陆家嘴|静安寺|南京东路|南京西路|淮海路|新天地|五角场|中山公园)?店",
+        r"([A-Za-z0-9\u4e00-\u9fa5·]{2,16})(?:狗咖|猫咖)",
+    ]
+    for pattern in fuzzy_patterns:
+        match = re.search(pattern, compact)
+        if match:
+            cleaned = clean_brand_candidate(match.group(1))
+            if cleaned:
+                return cleaned
+
+    return ""
+
+
 # -----------------------------
 # App Store verification helpers
 # -----------------------------
@@ -631,15 +762,17 @@ async def upload_memory(request_data: UploadRequest, request: Request):
         poi_lon, poi_lat = parse_location_string(exact_location)
     else:
         if not (text_content or image_base64 or source_url):
-            raise HTTPException(status_code=400, detail="MUST_PROVIDE_TEXT_OR_IMAGE")
+            raise HTTPException(status_code=400, detail="MUST_PROVIDE_INPUT")
 
         client = build_openai_client()
         system_prompt = (
-            "你是一个精准的位置实体提取引擎。"
-            "请提取用户截图、分享文案或链接语境中的【核心品牌名】（brand）和【城市】（city）。"
-            "品牌名必须尽量短，只保留真正的店名、品牌名，不要带菜系、分店、标点后缀。"
-            "如果文字很模糊，但图片里有明确店名，请优先相信图片。"
-            "如果是纯文本描述且未明确指明城市，city字段请留空。"
+            "你在解析小红书、点评、地图分享的探店内容。"
+            "请提取最可能的【核心品牌名】brand 和【城市】city。"
+            "品牌名必须尽量短，只保留真正的店名、品牌主名，不要带菜系、分店、商圈、标点后缀。"
+            "如果是“品牌名 + 商场/地标 + 店”，只保留品牌名，例如“和它交个朋友 百脑汇店”应提取为 brand=和它交个朋友。"
+            "如果图片和文字冲突，优先相信图片里的店名或商户卡片。"
+            "如果是纯文本社媒文案，也要尽量还原最可能的店名，不要轻易返回空字符串。"
+            "若文本里出现徐家汇、陆家嘴、静安寺、南京东路等地标，可将 city 推断为上海。"
             "只返回 JSON，如 {\"brand\":\"xxx\",\"city\":\"xxx\"}。"
         )
 
@@ -663,6 +796,38 @@ async def upload_memory(request_data: UploadRequest, request: Request):
                     source_url="",
                     image_only_fallback=True,
                 )
+
+            if not brand_name and text_content:
+                social_text_prompt = (
+                    "你正在解析小红书/点评口语化探店文案。"
+                    "任务是尽量还原最可能的店名主名，而不是保守返回空。"
+                    "如果出现“品牌名 + 商场/地标 + 店”，只提取品牌名。"
+                    "例如“和它交个朋友 百脑汇店”应输出 "
+                    "{\"brand\":\"和它交个朋友\",\"city\":\"上海\"}。"
+                    "若看到 #上海、上海citywalk、徐家汇、百脑汇 等线索，可推断 city=上海。"
+                    "只返回 JSON。"
+                )
+                logger.info("ai extract empty, retrying social-text prompt")
+                brand_name, social_city_hint = await run_ai_extract(
+                    client,
+                    social_text_prompt,
+                    text_content=text_content,
+                    image_base64="",
+                    source_url=source_url,
+                    image_only_fallback=False,
+                )
+                city_hint = city_hint or social_city_hint
+
+            if not brand_name and text_content:
+                heuristic_brand = extract_brand_from_social_text(text_content)
+                heuristic_city = infer_city_from_social_text(text_content)
+                logger.info(
+                    "social heuristic fallback | brand=%s | city=%s",
+                    heuristic_brand,
+                    heuristic_city,
+                )
+                brand_name = heuristic_brand or brand_name
+                city_hint = city_hint or heuristic_city
 
             logger.info("ai extract result | brand=%s | city=%s", brand_name, city_hint)
 
