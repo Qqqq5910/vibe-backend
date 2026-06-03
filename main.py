@@ -49,6 +49,9 @@ FREE_AI_LIMIT = int(os.getenv("FREE_AI_LIMIT", "10"))
 PRO_AI_LIMIT = int(os.getenv("PRO_AI_LIMIT", "100"))
 UPLOAD_RATE_LIMIT_PER_MIN = int(os.getenv("UPLOAD_RATE_LIMIT_PER_MIN", "12"))
 GENERAL_RATE_LIMIT_PER_MIN = int(os.getenv("GENERAL_RATE_LIMIT_PER_MIN", "120"))
+TIPS_RATE_LIMIT_PER_MIN = int(os.getenv("TIPS_RATE_LIMIT_PER_MIN", "20"))
+AMAP_TIPS_CACHE_TTL_SECONDS = int(os.getenv("AMAP_TIPS_CACHE_TTL_SECONDS", str(7 * 24 * 60 * 60)))
+AMAP_PLACE_CACHE_TTL_SECONDS = int(os.getenv("AMAP_PLACE_CACHE_TTL_SECONDS", str(30 * 24 * 60 * 60)))
 UPLOADS_PERSISTENT_WARNING = os.getenv("UPLOADS_PERSISTENT_WARNING", "1") == "1"
 ALLOW_INSECURE_UPGRADE = os.getenv("ALLOW_INSECURE_UPGRADE", "0") == "1"
 PRO_PRODUCT_ID = os.getenv("PRO_PRODUCT_ID", "com.vibelocator.pro")
@@ -199,12 +202,23 @@ def init_db() -> None:
             )
             """
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS amap_cache (
+                cache_key TEXT PRIMARY KEY,
+                response_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                ttl_seconds INTEGER NOT NULL
+            )
+            """
+        )
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_pool_device_id ON memory_pool(device_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_pool_brand ON memory_pool(brand)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_pool_created_at ON memory_pool(created_at)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_pool_device_created ON memory_pool(device_id, created_at DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_pool_device_brand ON memory_pool(device_id, brand)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_pool_brand_poi ON memory_pool(brand, poi_lat, poi_lon)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_amap_cache_created_at ON amap_cache(created_at)")
 
         cursor.execute("PRAGMA table_info(memory_pool)")
         existing_columns = {row["name"] for row in cursor.fetchall()}
@@ -307,6 +321,75 @@ def normalize_amap_value(value) -> str:
     if isinstance(value, list):
         return "".join(normalize_amap_value(item) for item in value if item is not None).strip()
     return str(value).strip()
+
+
+def rounded_coordinate_key(lon: float, lat: float, precision: int = 3) -> str:
+    return f"{round(float(lon), precision):.{precision}f},{round(float(lat), precision):.{precision}f}"
+
+
+def amap_cache_key(scope: str, params: dict) -> str:
+    safe_params = {
+        str(key): normalize_amap_value(value).lower()
+        for key, value in params.items()
+        if key != "key" and normalize_amap_value(value)
+    }
+    return f"{scope}:{json.dumps(safe_params, ensure_ascii=False, sort_keys=True)}"
+
+
+def get_cached_amap_response(cache_key: str) -> Optional[dict]:
+    now = time.time()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT response_json, created_at, ttl_seconds FROM amap_cache WHERE cache_key = ?",
+            (cache_key,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        if now - float(row["created_at"]) > int(row["ttl_seconds"]):
+            cursor.execute("DELETE FROM amap_cache WHERE cache_key = ?", (cache_key,))
+            return None
+        try:
+            return json.loads(row["response_json"])
+        except Exception:
+            cursor.execute("DELETE FROM amap_cache WHERE cache_key = ?", (cache_key,))
+            return None
+
+
+def store_amap_response(cache_key: str, response: dict, ttl_seconds: int) -> None:
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO amap_cache (cache_key, response_json, created_at, ttl_seconds)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                response_json = excluded.response_json,
+                created_at = excluded.created_at,
+                ttl_seconds = excluded.ttl_seconds
+            """,
+            (cache_key, json.dumps(response, ensure_ascii=False), time.time(), ttl_seconds),
+        )
+
+
+async def fetch_amap_json(
+    url: str,
+    params: dict,
+    cache_scope: str,
+    cache_params: dict,
+    ttl_seconds: int,
+) -> dict:
+    cache_key = amap_cache_key(cache_scope, cache_params)
+    cached = get_cached_amap_response(cache_key)
+    if cached is not None:
+        return cached
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = (await client.get(url, params=params)).json()
+
+    if response.get("status") == "1":
+        store_amap_response(cache_key, response, ttl_seconds)
+    return response
 
 
 def validate_lat_lon(lat: float, lon: float) -> None:
@@ -715,7 +798,7 @@ def healthz():
 
 @app.get("/api/tips")
 async def get_input_tips(keyword: str, lat: float, lon: float, request: Request):
-    await enforce_rate_limit(request, "tips", 60)
+    await enforce_rate_limit(request, "tips", TIPS_RATE_LIMIT_PER_MIN)
     validate_lat_lon(lat, lon)
     keyword = (keyword or "").strip()
     if not keyword:
@@ -726,10 +809,20 @@ async def get_input_tips(keyword: str, lat: float, lon: float, request: Request)
     gcj_lon, gcj_lat = wgs84_to_gcj02(lon, lat)
     url = "https://restapi.amap.com/v3/assistant/inputtips"
     params = {"key": AMAP_KEY, "keywords": keyword[:80], "location": f"{gcj_lon},{gcj_lat}", "datatype": "all"}
+    cache_params = {
+        "keywords": keyword[:80],
+        "location": rounded_coordinate_key(gcj_lon, gcj_lat),
+        "datatype": "all",
+    }
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            res = (await client.get(url, params=params)).json()
+        res = await fetch_amap_json(
+            url,
+            params,
+            cache_scope="inputtips",
+            cache_params=cache_params,
+            ttl_seconds=AMAP_TIPS_CACHE_TTL_SECONDS,
+        )
         if res.get("status") == "1":
             return [tip for tip in res.get("tips", []) if tip.get("location") and len(tip.get("location", "")) > 5]
         logger.warning("Amap inputtips failed | response=%s", res)
@@ -882,9 +975,19 @@ async def upload_memory(request_data: UploadRequest, request: Request):
             "city": city_hint,
             "location": f"{upload_gcj_lon},{upload_gcj_lat}",
         }
+        cache_params = {
+            "keywords": brand_name,
+            "city": city_hint,
+            "location": rounded_coordinate_key(upload_gcj_lon, upload_gcj_lat),
+        }
         try:
-            async with httpx.AsyncClient(timeout=10) as http_client:
-                search_res = (await http_client.get(amap_url, params=params)).json()
+            search_res = await fetch_amap_json(
+                amap_url,
+                params,
+                cache_scope="place_text",
+                cache_params=cache_params,
+                ttl_seconds=AMAP_PLACE_CACHE_TTL_SECONDS,
+            )
             if search_res.get("status") == "1" and search_res.get("pois"):
                 poi = search_res["pois"][0]
                 loc_str = normalize_amap_value(poi.get("location", ""))
@@ -971,76 +1074,52 @@ async def upload_memory(request_data: UploadRequest, request: Request):
 
 @app.post("/api/nearby")
 async def discover_nearby(request_data: NearbyRequest, request: Request):
-    await enforce_rate_limit(request, "nearby", 30)
+    await enforce_rate_limit(request, "nearby", 20)
     validate_lat_lon(request_data.lat, request_data.lon)
     if request_data.lat == 0.0 and request_data.lon == 0.0:
         return []
 
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT brand FROM memory_pool WHERE device_id = ?", (request_data.device_id,))
-        my_brands = [row["brand"] for row in cursor.fetchall()]
         cursor.execute(
             """
-            SELECT brand, poi_lat, poi_lon, COUNT(DISTINCT device_id) AS wish_count
+            SELECT brand, city, poi_lat, poi_lon, amap_name, amap_address
+            FROM memory_pool
+            WHERE device_id = ? AND poi_lat != 0.0 AND poi_lon != 0.0
+            ORDER BY created_at DESC
+            """,
+            (request_data.device_id,),
+        )
+        my_memories = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT brand, poi_lat, poi_lon, amap_name, amap_address, COUNT(DISTINCT device_id) AS wish_count
             FROM memory_pool
             WHERE device_id != ? AND poi_lat != 0.0 AND poi_lon != 0.0
-            GROUP BY brand, poi_lat, poi_lon
+            GROUP BY brand, poi_lat, poi_lon, amap_name, amap_address
             HAVING wish_count >= ?
             """,
             (request_data.device_id, BLIND_BOX_THRESHOLD),
         )
         public_boxes = cursor.fetchall()
 
-    if not AMAP_KEY:
-        raise HTTPException(status_code=500, detail="AMAP_KEY_MISSING")
-
-    gcj_lon, gcj_lat = wgs84_to_gcj02(request_data.lon, request_data.lat)
-    amap_url = "https://restapi.amap.com/v3/place/around"
     nearby_results = []
 
-    async def fetch_brand_nearby(client: httpx.AsyncClient, brand_name: str):
-        params = {
-            "key": AMAP_KEY,
-            "keywords": brand_name,
-            "location": f"{gcj_lon},{gcj_lat}",
-            "radius": "3000",
-            "sortrule": "distance",
-        }
-        try:
-            res = await client.get(amap_url, params=params)
-            return brand_name, res.json()
-        except Exception:
-            logger.exception("Amap nearby fetch failed | brand=%s", brand_name)
-            return brand_name, None
-
-    brands_to_query = my_brands[:30]  # 防止单个用户收藏太多导致外部请求过多
-    if brands_to_query:
-        async with httpx.AsyncClient(timeout=10) as client:
-            tasks = [fetch_brand_nearby(client, brand) for brand in brands_to_query]
-            responses = await asyncio.gather(*tasks)
-        for brand_name, search_res in responses:
-            if search_res and search_res.get("status") == "1":
-                for poi in search_res.get("pois", []):
-                    dist = int(poi.get("distance", 9999))
-                    if dist <= 3000:
-                        loc_str = poi.get("location", "")
-                        poi_lon, poi_lat = 0.0, 0.0
-                        if "," in loc_str:
-                            gcj_p_lon, gcj_p_lat = map(float, loc_str.split(","))
-                            poi_lon, poi_lat = gcj02_to_wgs84(gcj_p_lon, gcj_p_lat)
-                        nearby_results.append(
-                            {
-                                "brand": brand_name,
-                                "name": poi.get("name", ""),
-                                "address": poi.get("address", ""),
-                                "distance": str(dist),
-                                "lat": poi_lat,
-                                "lon": poi_lon,
-                                "is_public": False,
-                                "wish_count": 1,
-                            }
-                        )
+    for memory in my_memories:
+        dist = calculate_haversine_distance(request_data.lon, request_data.lat, memory["poi_lon"], memory["poi_lat"])
+        if dist <= 3000:
+            nearby_results.append(
+                {
+                    "brand": memory["brand"],
+                    "name": memory["amap_name"] or memory["brand"],
+                    "address": memory["amap_address"] or memory["city"],
+                    "distance": str(dist),
+                    "lat": memory["poi_lat"],
+                    "lon": memory["poi_lon"],
+                    "is_public": False,
+                    "wish_count": 1,
+                }
+            )
 
     for p in public_boxes:
         dist = calculate_haversine_distance(request_data.lon, request_data.lat, p["poi_lon"], p["poi_lat"])
@@ -1048,8 +1127,8 @@ async def discover_nearby(request_data: NearbyRequest, request: Request):
             nearby_results.append(
                 {
                     "brand": p["brand"],
-                    "name": f"神秘盲盒：{p['brand']}",
-                    "address": "周边高人气打卡地",
+                    "name": p["amap_name"] or f"神秘盲盒：{p['brand']}",
+                    "address": p["amap_address"] or "周边高人气打卡地",
                     "distance": str(dist),
                     "lat": p["poi_lat"],
                     "lon": p["poi_lon"],
