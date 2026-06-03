@@ -104,6 +104,7 @@ class UploadRequest(BaseModel):
     exact_name: Optional[str] = ""
     exact_location: Optional[str] = ""
     exact_district: Optional[str] = ""
+    exact_address: Optional[str] = ""
     device_id: str = Field(min_length=8, max_length=128)
     lat: float
     lon: float
@@ -205,6 +206,18 @@ def init_db() -> None:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_pool_device_brand ON memory_pool(device_id, brand)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_pool_brand_poi ON memory_pool(brand, poi_lat, poi_lon)")
 
+        cursor.execute("PRAGMA table_info(memory_pool)")
+        existing_columns = {row["name"] for row in cursor.fetchall()}
+        memory_columns = (
+            ("amap_name", "amap_name TEXT DEFAULT ''"),
+            ("amap_address", "amap_address TEXT DEFAULT ''"),
+            ("amap_location", "amap_location TEXT DEFAULT ''"),
+            ("amap_district", "amap_district TEXT DEFAULT ''"),
+        )
+        for column_name, column_sql in memory_columns:
+            if column_name not in existing_columns:
+                cursor.execute(f"ALTER TABLE memory_pool ADD COLUMN {column_sql}")
+
 
 @app.on_event("startup")
 async def startup_event() -> None:
@@ -288,6 +301,14 @@ def extract_core_brand(name: str) -> str:
 # -----------------------------
 # Utility helpers
 # -----------------------------
+def normalize_amap_value(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "".join(normalize_amap_value(item) for item in value if item is not None).strip()
+    return str(value).strip()
+
+
 def validate_lat_lon(lat: float, lon: float) -> None:
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         raise HTTPException(status_code=400, detail="INVALID_COORDINATES")
@@ -730,6 +751,7 @@ async def upload_memory(request_data: UploadRequest, request: Request):
     exact_name = (request_data.exact_name or "").strip()
     exact_location = (request_data.exact_location or "").strip()
     exact_district = (request_data.exact_district or "").strip()
+    exact_address = (request_data.exact_address or "").strip()
 
     if text_content and len(text_content) > MAX_TEXT_CHARS:
         raise HTTPException(status_code=413, detail="TEXT_TOO_LONG")
@@ -755,11 +777,19 @@ async def upload_memory(request_data: UploadRequest, request: Request):
     poi_lat = 0.0
     poi_lon = 0.0
     image_url = ""
+    amap_name = ""
+    amap_address = ""
+    amap_location = ""
+    amap_district = ""
 
     if exact_name and exact_location:
         brand_name = exact_name
         city_hint = exact_district
         poi_lon, poi_lat = parse_location_string(exact_location)
+        amap_name = exact_name
+        amap_address = exact_address
+        amap_location = exact_location
+        amap_district = exact_district
     else:
         if not (text_content or image_base64 or source_url):
             raise HTTPException(status_code=400, detail="MUST_PROVIDE_INPUT")
@@ -857,7 +887,16 @@ async def upload_memory(request_data: UploadRequest, request: Request):
                 search_res = (await http_client.get(amap_url, params=params)).json()
             if search_res.get("status") == "1" and search_res.get("pois"):
                 poi = search_res["pois"][0]
-                loc_str = poi.get("location", "")
+                loc_str = normalize_amap_value(poi.get("location", ""))
+                amap_name = normalize_amap_value(poi.get("name")) or brand_name
+                amap_address = normalize_amap_value(poi.get("address"))
+                amap_location = loc_str
+                amap_district = (
+                    normalize_amap_value(poi.get("adname"))
+                    or normalize_amap_value(poi.get("district"))
+                    or city_hint
+                )
+                city_hint = city_hint or amap_district
                 if "," in loc_str:
                     gcj_p_lon, gcj_p_lat = map(float, loc_str.split(","))
                     poi_lon, poi_lat = gcj02_to_wgs84(gcj_p_lon, gcj_p_lat)
@@ -886,11 +925,17 @@ async def upload_memory(request_data: UploadRequest, request: Request):
     if not clean_brand:
         raise HTTPException(status_code=422, detail="EMPTY_BRAND")
 
+    amap_name = amap_name or brand_name
+    amap_district = amap_district or city_hint
+
     with get_db() as conn:
         conn.execute(
             """
-            INSERT INTO memory_pool (brand, city, image_url, created_at, device_id, poi_lat, poi_lon)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO memory_pool (
+                brand, city, image_url, created_at, device_id, poi_lat, poi_lon,
+                amap_name, amap_address, amap_location, amap_district
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 clean_brand,
@@ -900,6 +945,10 @@ async def upload_memory(request_data: UploadRequest, request: Request):
                 device_id,
                 poi_lat,
                 poi_lon,
+                amap_name,
+                amap_address,
+                amap_location,
+                amap_district,
             ),
         )
 
@@ -912,6 +961,10 @@ async def upload_memory(request_data: UploadRequest, request: Request):
         "message": clean_brand,
         "poi_lat": poi_lat,
         "poi_lon": poi_lon,
+        "amap_name": amap_name,
+        "amap_address": amap_address,
+        "amap_location": amap_location,
+        "amap_district": amap_district,
         "is_immediate_nearby": dist_to_upload <= 500,
     }
 
@@ -1020,12 +1073,36 @@ def get_all_memories(device_id: str):
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, brand, city, created_at, image_url FROM memory_pool WHERE device_id = ? ORDER BY created_at DESC",
+            """
+            SELECT
+                id, brand, city, created_at, image_url, poi_lat, poi_lon,
+                amap_name, amap_address, amap_location, amap_district
+            FROM memory_pool
+            WHERE device_id = ?
+            ORDER BY created_at DESC
+            """,
             (device_id,),
         )
         rows = cursor.fetchall()
     return [
-        {"id": r["id"], "brand": r["brand"], "city": r["city"], "created_at": r["created_at"], "image_url": r["image_url"]}
+        {
+            "id": r["id"],
+            "brand": r["brand"],
+            "city": r["city"],
+            "created_at": r["created_at"],
+            "image_url": r["image_url"],
+            "poi_lat": r["poi_lat"],
+            "poi_lon": r["poi_lon"],
+            "amap_name": r["amap_name"] or r["brand"],
+            "amap_address": r["amap_address"] or "",
+            "amap_location": r["amap_location"] or "",
+            "amap_district": r["amap_district"] or r["city"],
+            "poi_name": r["amap_name"] or r["brand"],
+            "poi_address": r["amap_address"] or "",
+            "address": r["amap_address"] or "",
+            "district": r["amap_district"] or r["city"],
+            "location": r["amap_location"] or "",
+        }
         for r in rows
     ]
 
