@@ -59,12 +59,13 @@ QWEN_MODEL_IMAGE = os.getenv("QWEN_MODEL_IMAGE", "qwen-vl-max")
 QWEN_MODEL_TEXT = os.getenv("QWEN_MODEL_TEXT", "qwen-max")
 AMAP_KEY = os.getenv("AMAP_KEY", "")
 QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
-MIN_SUPPORTED_IOS_VERSION = os.getenv("MIN_SUPPORTED_IOS_VERSION", "1.2")
+MIN_SUPPORTED_IOS_VERSION = os.getenv("MIN_SUPPORTED_IOS_VERSION", "1.3")
 LATEST_IOS_VERSION = os.getenv("LATEST_IOS_VERSION", MIN_SUPPORTED_IOS_VERSION)
 APP_STORE_URL = os.getenv("APP_STORE_URL", "")
 FORCE_UPDATE_MESSAGE = os.getenv("FORCE_UPDATE_MESSAGE", "这个版本已经停止使用，请更新到最新版后继续。")
 FORCE_UPDATE_AFTER = os.getenv("FORCE_UPDATE_AFTER", "")
 ENFORCE_WHEN_APP_STORE_VERSION_AVAILABLE = os.getenv("ENFORCE_WHEN_APP_STORE_VERSION_AVAILABLE", "1") != "0"
+FORCE_LATEST_APP_STORE_VERSION = os.getenv("FORCE_LATEST_APP_STORE_VERSION", "1") != "0"
 
 # Apple App Store Server API config
 APPLE_ISSUER_ID = os.getenv("APPLE_ISSUER_ID", "")
@@ -811,6 +812,7 @@ def app_config(platform: str = "ios", bundle_id: str = "", version: str = ""):
         "app_store_url": APP_STORE_URL,
         "enforce_after": FORCE_UPDATE_AFTER,
         "enforce_when_app_store_version_available": ENFORCE_WHEN_APP_STORE_VERSION_AVAILABLE,
+        "force_latest_app_store_version": FORCE_LATEST_APP_STORE_VERSION,
         "message": FORCE_UPDATE_MESSAGE,
     }
 
