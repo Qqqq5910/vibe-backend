@@ -373,7 +373,7 @@ EE = 0.00669342162296594323
 
 
 def wgs84_to_gcj02(lng: float, lat: float) -> Tuple[float, float]:
-    if not (72.004 <= lng <= 137.8347 and 0.8293 <= lat <= 55.8271):
+    if not is_mainland_china_coordinate(lng, lat):
         return lng, lat
 
     def transform_lat(lng_: float, lat_: float) -> float:
@@ -402,10 +402,14 @@ def wgs84_to_gcj02(lng: float, lat: float) -> Tuple[float, float]:
 
 
 def gcj02_to_wgs84(lng: float, lat: float) -> Tuple[float, float]:
-    if not (72.004 <= lng <= 137.8347 and 0.8293 <= lat <= 55.8271):
+    if not is_mainland_china_coordinate(lng, lat):
         return lng, lat
     m_lng, m_lat = wgs84_to_gcj02(lng, lat)
     return lng * 2 - m_lng, lat * 2 - m_lat
+
+
+def is_mainland_china_coordinate(lng: float, lat: float) -> bool:
+    return 72.004 <= lng <= 137.8347 and 0.8293 <= lat <= 55.8271
 
 
 def calculate_haversine_distance(lon1: float, lat1: float, lon2: float, lat2: float) -> int:
@@ -1030,6 +1034,9 @@ async def get_input_tips(keyword: str, lat: float, lon: float, request: Request)
     keyword = (keyword or "").strip()
     if not keyword:
         return []
+    if not is_mainland_china_coordinate(lon, lat):
+        logger.info("Skipping Amap inputtips for non-China coordinate | keyword=%s | lat=%s | lon=%s", keyword, lat, lon)
+        return []
     if not AMAP_KEY:
         raise HTTPException(status_code=500, detail="AMAP_KEY_MISSING")
 
@@ -1191,49 +1198,52 @@ async def upload_memory(request_data: UploadRequest, request: Request):
             logger.exception("AI parse failed")
             raise HTTPException(status_code=500, detail="AI_PARSE_FAILED")
 
-        if not AMAP_KEY:
-            raise HTTPException(status_code=500, detail="AMAP_KEY_MISSING")
+        if is_mainland_china_coordinate(request_data.lon, request_data.lat):
+            if not AMAP_KEY:
+                raise HTTPException(status_code=500, detail="AMAP_KEY_MISSING")
 
-        upload_gcj_lon, upload_gcj_lat = wgs84_to_gcj02(request_data.lon, request_data.lat)
-        amap_url = "https://restapi.amap.com/v3/place/text"
-        params = {
-            "key": AMAP_KEY,
-            "keywords": brand_name,
-            "city": city_hint,
-            "location": f"{upload_gcj_lon},{upload_gcj_lat}",
-        }
-        cache_params = {
-            "keywords": brand_name,
-            "city": city_hint,
-            "location": rounded_coordinate_key(upload_gcj_lon, upload_gcj_lat),
-        }
-        try:
-            search_res = await fetch_amap_json(
-                amap_url,
-                params,
-                cache_scope="place_text",
-                cache_params=cache_params,
-                ttl_seconds=AMAP_PLACE_CACHE_TTL_SECONDS,
-            )
-            if search_res.get("status") == "1" and search_res.get("pois"):
-                poi = search_res["pois"][0]
-                loc_str = normalize_amap_value(poi.get("location", ""))
-                amap_name = normalize_amap_value(poi.get("name")) or brand_name
-                amap_address = normalize_amap_value(poi.get("address"))
-                amap_location = loc_str
-                amap_district = (
-                    normalize_amap_value(poi.get("adname"))
-                    or normalize_amap_value(poi.get("district"))
-                    or city_hint
+            upload_gcj_lon, upload_gcj_lat = wgs84_to_gcj02(request_data.lon, request_data.lat)
+            amap_url = "https://restapi.amap.com/v3/place/text"
+            params = {
+                "key": AMAP_KEY,
+                "keywords": brand_name,
+                "city": city_hint,
+                "location": f"{upload_gcj_lon},{upload_gcj_lat}",
+            }
+            cache_params = {
+                "keywords": brand_name,
+                "city": city_hint,
+                "location": rounded_coordinate_key(upload_gcj_lon, upload_gcj_lat),
+            }
+            try:
+                search_res = await fetch_amap_json(
+                    amap_url,
+                    params,
+                    cache_scope="place_text",
+                    cache_params=cache_params,
+                    ttl_seconds=AMAP_PLACE_CACHE_TTL_SECONDS,
                 )
-                city_hint = city_hint or amap_district
-                if "," in loc_str:
-                    gcj_p_lon, gcj_p_lat = map(float, loc_str.split(","))
-                    poi_lon, poi_lat = gcj02_to_wgs84(gcj_p_lon, gcj_p_lat)
-            else:
-                logger.info("Amap place text no result | brand=%s | city=%s", brand_name, city_hint)
-        except Exception:
-            logger.exception("Amap place search failed")
+                if search_res.get("status") == "1" and search_res.get("pois"):
+                    poi = search_res["pois"][0]
+                    loc_str = normalize_amap_value(poi.get("location", ""))
+                    amap_name = normalize_amap_value(poi.get("name")) or brand_name
+                    amap_address = normalize_amap_value(poi.get("address"))
+                    amap_location = loc_str
+                    amap_district = (
+                        normalize_amap_value(poi.get("adname"))
+                        or normalize_amap_value(poi.get("district"))
+                        or city_hint
+                    )
+                    city_hint = city_hint or amap_district
+                    if "," in loc_str:
+                        gcj_p_lon, gcj_p_lat = map(float, loc_str.split(","))
+                        poi_lon, poi_lat = gcj02_to_wgs84(gcj_p_lon, gcj_p_lat)
+                else:
+                    logger.info("Amap place text no result | brand=%s | city=%s", brand_name, city_hint)
+            except Exception:
+                logger.exception("Amap place search failed")
+        else:
+            logger.info("Skipping Amap place search for non-China coordinate | brand=%s", brand_name)
 
         if image_base64:
             try:
