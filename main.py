@@ -10,6 +10,8 @@ import asyncio
 import re
 import time
 import logging
+import hmac
+import shutil
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from typing import Optional, Dict, Deque, Tuple, List
@@ -39,8 +41,13 @@ logger = logging.getLogger("vibelocator-backend")
 # -----------------------------
 APP_ENV = os.getenv("APP_ENV", "production")
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
-DB_PATH = os.getenv("DB_PATH", "memories.db")
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
+PERSISTENT_DATA_DIR = os.getenv("PERSISTENT_DATA_DIR", "/data")
+DB_PATH = os.getenv("DB_PATH") or os.path.join(PERSISTENT_DATA_DIR, "memories.db")
+UPLOAD_DIR = os.getenv("UPLOAD_DIR") or os.path.join(PERSISTENT_DATA_DIR, "uploads")
+LEGACY_DB_PATH = os.getenv("LEGACY_DB_PATH", "memories.db")
+LEGACY_UPLOAD_DIR = os.getenv("LEGACY_UPLOAD_DIR", "uploads")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+REQUIRE_PERSISTENT_STORAGE = os.getenv("REQUIRE_PERSISTENT_STORAGE", "0") == "1"
 MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(4 * 1024 * 1024)))
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "300"))
 BLIND_BOX_THRESHOLD = int(os.getenv("BLIND_BOX_THRESHOLD", "2"))
@@ -91,6 +98,16 @@ if not QWEN_API_KEY:
 if UPLOADS_PERSISTENT_WARNING:
     logger.warning("Make sure %s and %s are on persistent storage in Zeabur.", DB_PATH, UPLOAD_DIR)
 
+_storage_uses_persistent_dir = (
+    os.path.abspath(DB_PATH).startswith(os.path.abspath(PERSISTENT_DATA_DIR) + os.sep)
+    and os.path.abspath(UPLOAD_DIR).startswith(os.path.abspath(PERSISTENT_DATA_DIR) + os.sep)
+)
+if REQUIRE_PERSISTENT_STORAGE and not _storage_uses_persistent_dir:
+    raise RuntimeError(
+        "Persistent storage is required. Set DB_PATH=/data/memories.db and UPLOAD_DIR=/data/uploads."
+    )
+
+os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = FastAPI(title="VibeLocator API", version="2.0.0")
@@ -165,6 +182,91 @@ async def enforce_rate_limit(request: Request, scope_key: str, limit: int) -> No
 # -----------------------------
 # DB helpers
 # -----------------------------
+def _same_path(left: str, right: str) -> bool:
+    return os.path.abspath(left) == os.path.abspath(right)
+
+
+def sqlite_table_count(path: str, table_name: str) -> int:
+    if not path or not os.path.exists(path):
+        return 0
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,),
+            )
+            if cursor.fetchone() is None:
+                return 0
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            return int(cursor.fetchone()[0])
+        finally:
+            conn.close()
+    except Exception:
+        logger.exception("Failed counting table %s in %s", table_name, path)
+        return 0
+
+
+def backup_sqlite_database(source_path: str, target_path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
+    source = sqlite3.connect(source_path)
+    target = sqlite3.connect(target_path)
+    try:
+        source.backup(target)
+        target.commit()
+    finally:
+        target.close()
+        source.close()
+
+
+def copy_legacy_uploads_if_needed() -> None:
+    if not LEGACY_UPLOAD_DIR or _same_path(LEGACY_UPLOAD_DIR, UPLOAD_DIR):
+        return
+    if not os.path.isdir(LEGACY_UPLOAD_DIR):
+        return
+
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    copied = 0
+    for name in os.listdir(LEGACY_UPLOAD_DIR):
+        source = os.path.join(LEGACY_UPLOAD_DIR, name)
+        target = os.path.join(UPLOAD_DIR, name)
+        if not os.path.isfile(source) or os.path.exists(target):
+            continue
+        try:
+            shutil.copy2(source, target)
+            copied += 1
+        except Exception:
+            logger.exception("Failed copying legacy upload %s", source)
+    if copied:
+        logger.info("Copied %s legacy upload files from %s to %s", copied, LEGACY_UPLOAD_DIR, UPLOAD_DIR)
+
+
+def migrate_legacy_storage_if_needed() -> None:
+    if _same_path(LEGACY_DB_PATH, DB_PATH):
+        copy_legacy_uploads_if_needed()
+        return
+
+    legacy_places = sqlite_table_count(LEGACY_DB_PATH, "memory_pool")
+    target_places = sqlite_table_count(DB_PATH, "memory_pool")
+    if legacy_places > 0 and target_places == 0:
+        logger.warning(
+            "Migrating legacy database from %s to %s | legacy_places=%s",
+            LEGACY_DB_PATH,
+            DB_PATH,
+            legacy_places,
+        )
+        backup_sqlite_database(LEGACY_DB_PATH, DB_PATH)
+    elif legacy_places > 0:
+        logger.info(
+            "Skipping legacy DB migration because target already has data | legacy=%s target=%s",
+            legacy_places,
+            target_places,
+        )
+
+    copy_legacy_uploads_if_needed()
+
+
 @contextmanager
 def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -242,8 +344,9 @@ def init_db() -> None:
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    migrate_legacy_storage_if_needed()
     init_db()
-    logger.info("Server started. env=%s base_url=%s", APP_ENV, BASE_URL)
+    logger.info("Server started. env=%s base_url=%s db=%s uploads=%s", APP_ENV, BASE_URL, DB_PATH, UPLOAD_DIR)
 
 
 @app.middleware("http")
@@ -402,6 +505,24 @@ async def fetch_amap_json(
 def validate_lat_lon(lat: float, lon: float) -> None:
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         raise HTTPException(status_code=400, detail="INVALID_COORDINATES")
+
+
+def require_admin(request: Request) -> None:
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="ADMIN_TOKEN_NOT_CONFIGURED")
+
+    auth_header = request.headers.get("authorization", "")
+    prefix = "Bearer "
+    token = auth_header[len(prefix):].strip() if auth_header.startswith(prefix) else ""
+    if not token or not hmac.compare_digest(token, ADMIN_TOKEN):
+        raise HTTPException(status_code=403, detail="ADMIN_FORBIDDEN")
+
+
+def masked_device_id(device_id: str) -> str:
+    value = (device_id or "").strip()
+    if len(value) <= 12:
+        return value[:2] + "***" if value else ""
+    return f"{value[:8]}...{value[-4:]}"
 
 
 def build_openai_client() -> AsyncOpenAI:
@@ -795,11 +916,19 @@ def mark_user_pro(device_id: str, transaction_id: str = "") -> None:
 # -----------------------------
 @app.get("/healthz")
 def healthz():
+    storage_uses_persistent_dir = (
+        os.path.abspath(DB_PATH).startswith(os.path.abspath(PERSISTENT_DATA_DIR) + os.sep)
+        and os.path.abspath(UPLOAD_DIR).startswith(os.path.abspath(PERSISTENT_DATA_DIR) + os.sep)
+    )
     return {
         "status": "ok",
         "time": datetime.utcnow().isoformat() + "Z",
         "db_path": DB_PATH,
         "upload_dir": UPLOAD_DIR,
+        "persistent_data_dir": PERSISTENT_DATA_DIR,
+        "storage_uses_persistent_dir": storage_uses_persistent_dir,
+        "persistent_data_dir_exists": os.path.isdir(PERSISTENT_DATA_DIR),
+        "persistent_data_dir_is_mount": os.path.ismount(PERSISTENT_DATA_DIR),
     }
 
 
@@ -814,6 +943,83 @@ def app_config(platform: str = "ios", bundle_id: str = "", version: str = ""):
         "enforce_when_app_store_version_available": ENFORCE_WHEN_APP_STORE_VERSION_AVAILABLE,
         "force_latest_app_store_version": FORCE_LATEST_APP_STORE_VERSION,
         "message": FORCE_UPDATE_MESSAGE,
+    }
+
+
+@app.get("/api/admin/stats")
+def admin_stats(request: Request, limit: int = 100, include_device_ids: bool = False):
+    require_admin(request)
+    limit = max(1, min(limit, 1000))
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        users_with_data = cursor.execute(
+            """
+            SELECT COUNT(DISTINCT device_id)
+            FROM memory_pool
+            WHERE device_id IS NOT NULL AND TRIM(device_id) != ''
+            """
+        ).fetchone()[0]
+        total_places = cursor.execute("SELECT COUNT(*) FROM memory_pool").fetchone()[0]
+        users_in_profiles = cursor.execute("SELECT COUNT(*) FROM user_profiles").fetchone()[0]
+        places_with_coordinates = cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM memory_pool
+            WHERE poi_lat != 0.0 AND poi_lon != 0.0
+            """
+        ).fetchone()[0]
+        places_with_address = cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM memory_pool
+            WHERE TRIM(COALESCE(amap_address, '')) != ''
+            """
+        ).fetchone()[0]
+        top_users = cursor.execute(
+            """
+            SELECT
+                device_id,
+                COUNT(*) AS place_count,
+                MIN(created_at) AS first_created_at,
+                MAX(created_at) AS last_created_at,
+                SUM(CASE WHEN poi_lat != 0.0 AND poi_lon != 0.0 THEN 1 ELSE 0 END) AS places_with_coordinates,
+                SUM(CASE WHEN TRIM(COALESCE(amap_address, '')) != '' THEN 1 ELSE 0 END) AS places_with_address
+            FROM memory_pool
+            WHERE device_id IS NOT NULL AND TRIM(device_id) != ''
+            GROUP BY device_id
+            ORDER BY place_count DESC, last_created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    return {
+        "db_path": DB_PATH,
+        "upload_dir": UPLOAD_DIR,
+        "persistent_data_dir": PERSISTENT_DATA_DIR,
+        "is_likely_persistent": (
+            os.path.abspath(DB_PATH).startswith(os.path.abspath(PERSISTENT_DATA_DIR) + os.sep)
+            and os.path.abspath(UPLOAD_DIR).startswith(os.path.abspath(PERSISTENT_DATA_DIR) + os.sep)
+        ),
+        "persistent_data_dir_exists": os.path.isdir(PERSISTENT_DATA_DIR),
+        "persistent_data_dir_is_mount": os.path.ismount(PERSISTENT_DATA_DIR),
+        "users_with_data": users_with_data,
+        "users_in_profiles": users_in_profiles,
+        "total_places": total_places,
+        "places_with_coordinates": places_with_coordinates,
+        "places_with_address": places_with_address,
+        "users": [
+            {
+                "device_id": row["device_id"] if include_device_ids else masked_device_id(row["device_id"]),
+                "place_count": row["place_count"],
+                "places_with_coordinates": row["places_with_coordinates"],
+                "places_with_address": row["places_with_address"],
+                "first_created_at": row["first_created_at"],
+                "last_created_at": row["last_created_at"],
+            }
+            for row in top_users
+        ],
     }
 
 
