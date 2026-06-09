@@ -1267,31 +1267,51 @@ ADMIN_DASHBOARD_HTML = r"""
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 14px;
-      margin-bottom: 14px;
+      margin: 18px 0 14px;
     }
     .tool-card {
-      background: var(--solid);
+      appearance: none;
+      width: 100%;
+      min-height: 104px;
+      text-align: left;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+      padding: 16px;
+      background: rgba(255, 255, 255, 0.88);
       border: 1px solid var(--line);
       border-radius: 20px;
       box-shadow: 0 10px 28px rgba(43, 75, 67, 0.07);
-      overflow: hidden;
-    }
-    .tool-card summary {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 18px;
+      color: var(--ink);
       cursor: pointer;
-      list-style: none;
-      user-select: none;
+      transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
     }
-    .tool-card summary::-webkit-details-marker {
-      display: none;
+    .tool-card:hover,
+    .tool-card.active {
+      transform: translateY(-1px);
+      background: var(--solid);
+      border-color: rgba(47, 125, 91, 0.30);
+      box-shadow: 0 16px 34px rgba(43, 75, 67, 0.10);
+    }
+    .tool-card.active {
+      outline: 4px solid rgba(47, 125, 91, 0.10);
+    }
+    .tool-icon {
+      width: 42px;
+      height: 42px;
+      border-radius: 14px;
+      display: grid;
+      place-items: center;
+      background: rgba(47, 125, 91, 0.12);
+      color: var(--leaf);
+      font-size: 20px;
+      font-weight: 900;
     }
     .tool-title {
       display: block;
       font-weight: 900;
+      font-size: 17px;
       margin-bottom: 5px;
     }
     .tool-desc {
@@ -1302,22 +1322,36 @@ ADMIN_DASHBOARD_HTML = r"""
     }
     .tool-chevron {
       flex: 0 0 auto;
-      color: var(--lake);
-      font-size: 13px;
+      color: var(--muted);
+      font-size: 22px;
       font-weight: 900;
     }
-    .tool-card[open] .tool-chevron {
+    .tool-workspace {
+      padding: 20px;
+      margin-bottom: 14px;
+    }
+    .tool-panel-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+    .tool-panel-title {
+      margin: 0 0 6px;
+      font-size: 24px;
+      line-height: 1.2;
+    }
+    .tool-panel-desc {
+      margin: 0;
       color: var(--muted);
+      line-height: 1.5;
     }
-    .tool-card[open] .tool-chevron::before {
-      content: "收起";
-    }
-    .tool-card[open] .tool-chevron span {
+    .tool-panel {
       display: none;
     }
-    .tool-body {
-      padding: 0 18px 18px;
-      border-top: 1px solid var(--line);
+    .tool-panel.active {
+      display: block;
     }
     .search-form {
       display: grid;
@@ -1385,6 +1419,9 @@ ADMIN_DASHBOARD_HTML = r"""
       header, .toolbar { align-items: flex-start; flex-direction: column; }
       .cards, .storage { grid-template-columns: 1fr 1fr; }
       .admin-tools { grid-template-columns: 1fr; }
+      .tool-card { min-height: 86px; }
+      .tool-workspace { padding: 16px; }
+      .tool-panel-header { flex-direction: column; }
       .place-item { grid-template-columns: 1fr; }
       .search-form, .migrate-form, .delete-form, .search-result { grid-template-columns: 1fr; }
       .place-actions { justify-content: flex-start; }
@@ -1449,15 +1486,42 @@ ADMIN_DASHBOARD_HTML = r"""
       </div>
 
       <div class="admin-tools">
-        <details id="searchTool" class="tool-card">
-          <summary>
-            <span>
-              <span class="tool-title">搜索用户旧数据</span>
-              <span class="tool-desc">按店名、城市、地址或设备 ID 找旧记录。</span>
-            </span>
-            <span class="tool-chevron"><span>展开</span></span>
-          </summary>
-          <div class="tool-body">
+        <button class="tool-card" type="button" data-tool-target="searchToolPanel">
+          <span class="tool-icon">⌕</span>
+          <span>
+            <span class="tool-title">搜索旧数据</span>
+            <span class="tool-desc">按店名、城市、地址或设备 ID 找记录</span>
+          </span>
+          <span class="tool-chevron">›</span>
+        </button>
+        <button class="tool-card" type="button" data-tool-target="migrateToolPanel">
+          <span class="tool-icon">⇄</span>
+          <span>
+            <span class="tool-title">迁移/恢复</span>
+            <span class="tool-desc">把旧 ID 的地点复制到新 ID</span>
+          </span>
+          <span class="tool-chevron">›</span>
+        </button>
+        <button class="tool-card" type="button" data-tool-target="deleteDeviceToolPanel">
+          <span class="tool-icon">!</span>
+          <span>
+            <span class="tool-title">删除设备</span>
+            <span class="tool-desc">删除指定设备的地点和档案</span>
+          </span>
+          <span class="tool-chevron">›</span>
+        </button>
+      </div>
+
+      <div id="toolWorkspace" class="panel tool-workspace hidden">
+        <div id="searchToolPanel" class="tool-panel">
+          <div class="tool-panel-header">
+            <div>
+              <h2 class="tool-panel-title">搜索用户旧数据</h2>
+              <p class="tool-panel-desc">按店名、城市、地址或设备 ID 找旧记录，找到后可以直接填入恢复或删除。</p>
+            </div>
+            <button class="secondary small close-tool-button" type="button">收起</button>
+          </div>
+          <div>
             <form id="searchForm" class="search-form">
               <div>
                 <label for="searchInput">搜索关键词</label>
@@ -1468,17 +1532,17 @@ ADMIN_DASHBOARD_HTML = r"""
             <div id="searchStatus" class="status"></div>
             <div id="searchResults" class="search-results"></div>
           </div>
-        </details>
+        </div>
 
-        <details id="migrateTool" class="tool-card">
-          <summary>
-            <span>
-              <span class="tool-title">用户数据迁移/恢复</span>
-              <span class="tool-desc">把旧 ID 的地点复制到新 ID，旧数据保留。</span>
-            </span>
-            <span class="tool-chevron"><span>展开</span></span>
-          </summary>
-          <div class="tool-body">
+        <div id="migrateToolPanel" class="tool-panel">
+          <div class="tool-panel-header">
+            <div>
+              <h2 class="tool-panel-title">用户数据迁移/恢复</h2>
+              <p class="tool-panel-desc">把旧设备 ID 的地点复制到新设备 ID，旧 ID 数据仍然保留。</p>
+            </div>
+            <button class="secondary small close-tool-button" type="button">收起</button>
+          </div>
+          <div>
             <form id="migrateForm" class="migrate-form">
               <div>
                 <label for="fromDeviceInput">旧设备 ID</label>
@@ -1492,17 +1556,17 @@ ADMIN_DASHBOARD_HTML = r"""
             </form>
             <div id="migrateStatus" class="status">只复制地点到新 ID，不删除旧 ID 数据。</div>
           </div>
-        </details>
+        </div>
 
-        <details id="deleteDeviceTool" class="tool-card">
-          <summary>
-            <span>
-              <span class="tool-title">删除设备数据</span>
-              <span class="tool-desc">删除指定设备的地点和档案，需二次输入确认。</span>
-            </span>
-            <span class="tool-chevron"><span>展开</span></span>
-          </summary>
-          <div class="tool-body">
+        <div id="deleteDeviceToolPanel" class="tool-panel">
+          <div class="tool-panel-header">
+            <div>
+              <h2 class="tool-panel-title">删除设备数据</h2>
+              <p class="tool-panel-desc">删除指定设备的地点记录和用户档案。需要再次输入同一个设备 ID 确认。</p>
+            </div>
+            <button class="secondary small close-tool-button" type="button">收起</button>
+          </div>
+          <div>
             <form id="deleteDeviceForm" class="delete-form">
               <div>
                 <label for="deleteDeviceInput">要删除的设备 ID</label>
@@ -1516,7 +1580,7 @@ ADMIN_DASHBOARD_HTML = r"""
             </form>
             <div id="deleteDeviceStatus" class="status">会删除该设备的地点记录和用户档案，不删除上传截图文件。</div>
           </div>
-        </details>
+        </div>
       </div>
 
       <div id="emptyState" class="empty hidden">还没有用户地点数据。</div>
@@ -1555,13 +1619,14 @@ ADMIN_DASHBOARD_HTML = r"""
     const searchButton = document.getElementById("searchButton");
     const searchStatus = document.getElementById("searchStatus");
     const searchResults = document.getElementById("searchResults");
-    const migrateTool = document.getElementById("migrateTool");
+    const toolWorkspace = document.getElementById("toolWorkspace");
+    const toolCards = Array.from(document.querySelectorAll(".tool-card[data-tool-target]"));
+    const toolPanels = Array.from(document.querySelectorAll(".tool-panel"));
     const migrateForm = document.getElementById("migrateForm");
     const fromDeviceInput = document.getElementById("fromDeviceInput");
     const toDeviceInput = document.getElementById("toDeviceInput");
     const migrateButton = document.getElementById("migrateButton");
     const migrateStatus = document.getElementById("migrateStatus");
-    const deleteDeviceTool = document.getElementById("deleteDeviceTool");
     const deleteDeviceForm = document.getElementById("deleteDeviceForm");
     const deleteDeviceInput = document.getElementById("deleteDeviceInput");
     const confirmDeleteDeviceInput = document.getElementById("confirmDeleteDeviceInput");
@@ -1574,6 +1639,26 @@ ADMIN_DASHBOARD_HTML = r"""
       loginPanel.classList.toggle("hidden", !visible);
       dashboard.classList.toggle("hidden", visible);
       headerActions.classList.toggle("hidden", visible);
+    }
+
+    function openTool(panelId) {
+      toolWorkspace.classList.remove("hidden");
+      toolPanels.forEach(panel => panel.classList.toggle("active", panel.id === panelId));
+      toolCards.forEach(card => {
+        const active = card.dataset.toolTarget === panelId;
+        card.classList.toggle("active", active);
+        card.setAttribute("aria-expanded", active ? "true" : "false");
+      });
+      toolWorkspace.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+
+    function closeTools() {
+      toolWorkspace.classList.add("hidden");
+      toolPanels.forEach(panel => panel.classList.remove("active"));
+      toolCards.forEach(card => {
+        card.classList.remove("active");
+        card.setAttribute("aria-expanded", "false");
+      });
     }
 
     function escapeHtml(value) {
@@ -1938,11 +2023,26 @@ ADMIN_DASHBOARD_HTML = r"""
     searchForm.addEventListener("submit", searchPlaces);
     migrateForm.addEventListener("submit", migrateUserData);
     deleteDeviceForm.addEventListener("submit", deleteDeviceData);
+    toolCards.forEach(card => {
+      card.setAttribute("aria-expanded", "false");
+      card.addEventListener("click", () => {
+        const target = card.dataset.toolTarget;
+        const isActive = card.classList.contains("active");
+        if (isActive) {
+          closeTools();
+        } else if (target) {
+          openTool(target);
+        }
+      });
+    });
+    document.querySelectorAll(".close-tool-button").forEach(button => {
+      button.addEventListener("click", closeTools);
+    });
     searchResults.addEventListener("click", event => {
       const oldButton = event.target.closest(".fill-old-device-button");
       if (oldButton) {
         fromDeviceInput.value = oldButton.dataset.deviceId || "";
-        migrateTool.open = true;
+        openTool("migrateToolPanel");
         migrateStatus.classList.remove("error");
         migrateStatus.textContent = "已填入旧设备 ID。请再填新设备 ID 后复制恢复。";
         return;
@@ -1952,7 +2052,7 @@ ADMIN_DASHBOARD_HTML = r"""
       if (deleteButton) {
         deleteDeviceInput.value = deleteButton.dataset.deviceId || "";
         confirmDeleteDeviceInput.value = "";
-        deleteDeviceTool.open = true;
+        openTool("deleteDeviceToolPanel");
         deleteDeviceStatus.classList.remove("error");
         deleteDeviceStatus.textContent = "已填入要删除的设备 ID。请再次输入同一个 ID 后删除。";
       }
