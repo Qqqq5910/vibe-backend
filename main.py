@@ -161,6 +161,12 @@ class AdminMigrateRequest(BaseModel):
     dry_run: bool = False
 
 
+class AdminDeleteDeviceRequest(BaseModel):
+    device_id: str = Field(min_length=8, max_length=128)
+    confirm_device_id: str = Field(min_length=8, max_length=128)
+    dry_run: bool = False
+
+
 # -----------------------------
 # Lightweight rate limiter
 # -----------------------------
@@ -1094,6 +1100,10 @@ ADMIN_DASHBOARD_HTML = r"""
       border: 1px solid var(--line);
       box-shadow: none;
     }
+    button.danger {
+      background: linear-gradient(135deg, #b42318, #c2410c);
+      box-shadow: 0 10px 22px rgba(180, 35, 24, 0.18);
+    }
     button:disabled {
       opacity: 0.6;
       cursor: wait;
@@ -1265,6 +1275,12 @@ ADMIN_DASHBOARD_HTML = r"""
       gap: 12px;
       align-items: end;
     }
+    .delete-form {
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) auto;
+      gap: 12px;
+      align-items: end;
+    }
     .search-results {
       display: grid;
       gap: 10px;
@@ -1313,7 +1329,7 @@ ADMIN_DASHBOARD_HTML = r"""
       header, .toolbar { align-items: flex-start; flex-direction: column; }
       .cards, .storage { grid-template-columns: 1fr 1fr; }
       .place-item { grid-template-columns: 1fr; }
-      .search-form, .migrate-form, .search-result { grid-template-columns: 1fr; }
+      .search-form, .migrate-form, .delete-form, .search-result { grid-template-columns: 1fr; }
       .place-actions { justify-content: flex-start; }
       table { display: block; overflow-x: auto; }
     }
@@ -1402,6 +1418,21 @@ ADMIN_DASHBOARD_HTML = r"""
         <div id="migrateStatus" class="status">只复制地点到新 ID，不删除旧 ID 数据。</div>
       </div>
 
+      <div class="panel search-panel">
+        <form id="deleteDeviceForm" class="delete-form">
+          <div>
+            <label for="deleteDeviceInput">要删除的设备 ID</label>
+            <input id="deleteDeviceInput" type="text" placeholder="删除这个 ID 的地点和档案" />
+          </div>
+          <div>
+            <label for="confirmDeleteDeviceInput">再次输入设备 ID</label>
+            <input id="confirmDeleteDeviceInput" type="text" placeholder="必须完全一致" />
+          </div>
+          <button id="deleteDeviceButton" class="danger" type="submit">删除设备</button>
+        </form>
+        <div id="deleteDeviceStatus" class="status">会删除该设备的地点记录和用户档案，不删除上传截图文件。</div>
+      </div>
+
       <div id="emptyState" class="empty hidden">还没有用户地点数据。</div>
       <table id="usersTable" class="hidden">
         <thead>
@@ -1443,6 +1474,11 @@ ADMIN_DASHBOARD_HTML = r"""
     const toDeviceInput = document.getElementById("toDeviceInput");
     const migrateButton = document.getElementById("migrateButton");
     const migrateStatus = document.getElementById("migrateStatus");
+    const deleteDeviceForm = document.getElementById("deleteDeviceForm");
+    const deleteDeviceInput = document.getElementById("deleteDeviceInput");
+    const confirmDeleteDeviceInput = document.getElementById("confirmDeleteDeviceInput");
+    const deleteDeviceButton = document.getElementById("deleteDeviceButton");
+    const deleteDeviceStatus = document.getElementById("deleteDeviceStatus");
     const placesCache = new Map();
     let latestSearchResults = [];
 
@@ -1526,6 +1562,7 @@ ADMIN_DASHBOARD_HTML = r"""
           </div>
           <div class="place-actions">
             <button class="secondary small fill-old-device-button" type="button" data-device-id="${escapeHtml(result.device_id)}">填旧 ID</button>
+            <button class="secondary small fill-delete-device-button" type="button" data-device-id="${escapeHtml(result.device_id)}">填删除 ID</button>
             ${result.map_url ? `<a href="${escapeHtml(result.map_url)}" target="_blank" rel="noreferrer">地图</a>` : ""}
             ${result.image_url ? `<a href="${escapeHtml(result.image_url)}" target="_blank" rel="noreferrer">截图</a>` : ""}
           </div>
@@ -1720,6 +1757,60 @@ ADMIN_DASHBOARD_HTML = r"""
       }
     }
 
+    async function deleteDeviceData(event) {
+      event.preventDefault();
+      const deviceId = deleteDeviceInput.value.trim();
+      const confirmDeviceId = confirmDeleteDeviceInput.value.trim();
+
+      deleteDeviceStatus.classList.remove("error");
+      if (deviceId.length < 8 || confirmDeviceId.length < 8) {
+        deleteDeviceStatus.textContent = "设备 ID 和确认设备 ID 都至少需要 8 位。";
+        deleteDeviceStatus.classList.add("error");
+        return;
+      }
+      if (deviceId !== confirmDeviceId) {
+        deleteDeviceStatus.textContent = "两次输入的设备 ID 不一致。";
+        deleteDeviceStatus.classList.add("error");
+        return;
+      }
+
+      const ok = window.confirm("确认删除这个设备的地点记录和用户档案？这个操作不能从后台撤销。");
+      if (!ok) return;
+
+      deleteDeviceButton.disabled = true;
+      deleteDeviceStatus.textContent = "正在删除设备数据...";
+
+      try {
+        const response = await fetch("/api/admin/devices/delete", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            device_id: deviceId,
+            confirm_device_id: confirmDeviceId,
+            dry_run: false
+          })
+        });
+        if (!response.ok) {
+          const message = response.status === 404 ? "这个设备没有可删除的数据" : `HTTP ${response.status}`;
+          throw new Error(message);
+        }
+        const data = await response.json();
+        placesCache.delete(deviceId);
+        latestSearchResults = latestSearchResults.filter(result => result.device_id !== deviceId);
+        renderSearchResults(latestSearchResults);
+        deleteDeviceInput.value = "";
+        confirmDeleteDeviceInput.value = "";
+        deleteDeviceStatus.textContent = `删除完成：删除 ${data.deleted_place_count} 条地点记录，删除 ${data.deleted_profile_count} 条用户档案。截图文件未删除。`;
+        await loadStats();
+      } catch (error) {
+        deleteDeviceStatus.textContent = `删除失败：${error.message}`;
+        deleteDeviceStatus.classList.add("error");
+      } finally {
+        deleteDeviceButton.disabled = false;
+      }
+    }
+
     loginForm.addEventListener("submit", async event => {
       event.preventDefault();
       loginStatus.textContent = "正在验证...";
@@ -1758,12 +1849,23 @@ ADMIN_DASHBOARD_HTML = r"""
     });
     searchForm.addEventListener("submit", searchPlaces);
     migrateForm.addEventListener("submit", migrateUserData);
+    deleteDeviceForm.addEventListener("submit", deleteDeviceData);
     searchResults.addEventListener("click", event => {
-      const button = event.target.closest(".fill-old-device-button");
-      if (!button) return;
-      fromDeviceInput.value = button.dataset.deviceId || "";
-      migrateStatus.classList.remove("error");
-      migrateStatus.textContent = "已填入旧设备 ID。请再填新设备 ID 后复制恢复。";
+      const oldButton = event.target.closest(".fill-old-device-button");
+      if (oldButton) {
+        fromDeviceInput.value = oldButton.dataset.deviceId || "";
+        migrateStatus.classList.remove("error");
+        migrateStatus.textContent = "已填入旧设备 ID。请再填新设备 ID 后复制恢复。";
+        return;
+      }
+
+      const deleteButton = event.target.closest(".fill-delete-device-button");
+      if (deleteButton) {
+        deleteDeviceInput.value = deleteButton.dataset.deviceId || "";
+        confirmDeleteDeviceInput.value = "";
+        deleteDeviceStatus.classList.remove("error");
+        deleteDeviceStatus.textContent = "已填入要删除的设备 ID。请再次输入同一个 ID 后删除。";
+      }
     });
     usersBody.addEventListener("click", event => {
       const button = event.target.closest(".places-button");
@@ -2087,6 +2189,48 @@ def admin_migrate_user_data(payload: AdminMigrateRequest, request: Request):
         "would_copy_count": len(rows_to_copy),
         "copied_count": 0 if payload.dry_run else len(copied_ids),
         "copied_ids": [] if payload.dry_run else copied_ids,
+    }
+
+
+@app.post("/api/admin/devices/delete")
+def admin_delete_device(payload: AdminDeleteDeviceRequest, request: Request):
+    require_admin(request)
+    device_id = payload.device_id.strip()
+    confirm_device_id = payload.confirm_device_id.strip()
+    if device_id != confirm_device_id:
+        raise HTTPException(status_code=400, detail="CONFIRM_DEVICE_ID_MISMATCH")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        place_count = cursor.execute(
+            "SELECT COUNT(*) FROM memory_pool WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()[0]
+        profile_count = cursor.execute(
+            "SELECT COUNT(*) FROM user_profiles WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()[0]
+
+        if place_count == 0 and profile_count == 0:
+            raise HTTPException(status_code=404, detail="DEVICE_NOT_FOUND")
+
+        if not payload.dry_run:
+            cursor.execute("DELETE FROM memory_pool WHERE device_id = ?", (device_id,))
+            deleted_place_count = cursor.rowcount
+            cursor.execute("DELETE FROM user_profiles WHERE device_id = ?", (device_id,))
+            deleted_profile_count = cursor.rowcount
+        else:
+            deleted_place_count = 0
+            deleted_profile_count = 0
+
+    return {
+        "status": "dry_run" if payload.dry_run else "success",
+        "device_id": device_id,
+        "place_count": place_count,
+        "profile_count": profile_count,
+        "deleted_place_count": deleted_place_count,
+        "deleted_profile_count": deleted_profile_count,
+        "uploads_deleted": False,
     }
 
 
