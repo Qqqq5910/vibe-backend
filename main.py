@@ -18,7 +18,8 @@ from typing import Optional, Dict, Deque, Tuple, List
 
 import jwt
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Response
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -47,6 +48,7 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR") or os.path.join(PERSISTENT_DATA_DIR, "uploa
 LEGACY_DB_PATH = os.getenv("LEGACY_DB_PATH", "memories.db")
 LEGACY_UPLOAD_DIR = os.getenv("LEGACY_UPLOAD_DIR", "uploads")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+ADMIN_COOKIE_NAME = "vibe_admin_token"
 REQUIRE_PERSISTENT_STORAGE = os.getenv("REQUIRE_PERSISTENT_STORAGE", "0") == "1"
 MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(4 * 1024 * 1024)))
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "300"))
@@ -146,6 +148,10 @@ class NearbyRequest(BaseModel):
 class UpgradeRequest(BaseModel):
     device_id: str = Field(min_length=8, max_length=128)
     transaction_id: Optional[str] = None
+
+
+class AdminLoginRequest(BaseModel):
+    token: str = Field(min_length=16, max_length=256)
 
 
 # -----------------------------
@@ -517,7 +523,9 @@ def require_admin(request: Request) -> None:
 
     auth_header = request.headers.get("authorization", "")
     prefix = "Bearer "
-    token = auth_header[len(prefix):].strip() if auth_header.startswith(prefix) else ""
+    bearer_token = auth_header[len(prefix):].strip() if auth_header.startswith(prefix) else ""
+    cookie_token = request.cookies.get(ADMIN_COOKIE_NAME, "").strip()
+    token = bearer_token or cookie_token
     if not token or not hmac.compare_digest(token, ADMIN_TOKEN):
         raise HTTPException(status_code=403, detail="ADMIN_FORBIDDEN")
 
@@ -918,6 +926,479 @@ def mark_user_pro(device_id: str, transaction_id: str = "") -> None:
 # -----------------------------
 # Routes
 # -----------------------------
+ADMIN_DASHBOARD_HTML = r"""
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>路过心动后台</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #152420;
+      --muted: #718078;
+      --line: rgba(21, 36, 32, 0.10);
+      --surface: rgba(255, 255, 255, 0.78);
+      --solid: #ffffff;
+      --leaf: #2f7d5b;
+      --lake: #227796;
+      --warn: #b7791f;
+      --bad: #b42318;
+      --shadow: 0 18px 48px rgba(43, 75, 67, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 12% 12%, rgba(47, 125, 91, 0.16), transparent 30%),
+        radial-gradient(circle at 88% 6%, rgba(34, 119, 150, 0.13), transparent 28%),
+        linear-gradient(180deg, #f7fbf7 0%, #eef7f4 48%, #f8faf8 100%);
+    }
+    main {
+      width: min(1120px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 48px 0 64px;
+    }
+    header {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(30px, 5vw, 52px);
+      letter-spacing: 0;
+      line-height: 1.06;
+    }
+    .sub {
+      margin: 0;
+      color: var(--muted);
+      font-size: 16px;
+    }
+    .panel {
+      background: var(--surface);
+      border: 1px solid rgba(255, 255, 255, 0.72);
+      box-shadow: var(--shadow);
+      border-radius: 24px;
+      backdrop-filter: blur(18px);
+    }
+    .login {
+      max-width: 520px;
+      padding: 28px;
+    }
+    label {
+      display: block;
+      margin-bottom: 10px;
+      font-weight: 700;
+    }
+    input {
+      width: 100%;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.86);
+      border-radius: 16px;
+      padding: 14px 16px;
+      font-size: 16px;
+      outline: none;
+    }
+    input:focus {
+      border-color: rgba(47, 125, 91, 0.52);
+      box-shadow: 0 0 0 4px rgba(47, 125, 91, 0.12);
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 16px;
+      background: linear-gradient(135deg, var(--leaf), var(--lake));
+      color: white;
+      font-weight: 800;
+      font-size: 15px;
+      padding: 12px 18px;
+      cursor: pointer;
+      box-shadow: 0 10px 22px rgba(34, 119, 150, 0.20);
+    }
+    button.secondary {
+      background: rgba(255, 255, 255, 0.82);
+      color: var(--ink);
+      border: 1px solid var(--line);
+      box-shadow: none;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: wait;
+    }
+    .status {
+      min-height: 22px;
+      margin-top: 14px;
+      color: var(--muted);
+    }
+    .status.error { color: var(--bad); }
+    .hidden { display: none !important; }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin: 22px 0;
+    }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+    .card {
+      padding: 20px;
+      background: var(--solid);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      box-shadow: 0 10px 28px rgba(43, 75, 67, 0.07);
+    }
+    .metric {
+      font-size: 34px;
+      line-height: 1;
+      font-weight: 900;
+      margin-bottom: 8px;
+    }
+    .label {
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .storage {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      padding: 18px;
+      margin-bottom: 14px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-weight: 800;
+      background: rgba(47, 125, 91, 0.12);
+      color: var(--leaf);
+    }
+    .badge.warn {
+      background: rgba(183, 121, 31, 0.14);
+      color: var(--warn);
+    }
+    code {
+      display: block;
+      overflow-wrap: anywhere;
+      color: var(--muted);
+      margin-top: 8px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      background: var(--solid);
+      border-radius: 20px;
+      box-shadow: 0 10px 28px rgba(43, 75, 67, 0.07);
+    }
+    th, td {
+      padding: 14px 16px;
+      text-align: left;
+      border-bottom: 1px solid var(--line);
+      font-size: 14px;
+      vertical-align: top;
+    }
+    th {
+      color: var(--muted);
+      font-size: 13px;
+      background: rgba(246, 250, 248, 0.92);
+    }
+    tr:last-child td { border-bottom: 0; }
+    .device {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      overflow-wrap: anywhere;
+      max-width: 360px;
+    }
+    .empty {
+      padding: 28px;
+      text-align: center;
+      color: var(--muted);
+      background: var(--solid);
+      border-radius: 20px;
+      border: 1px solid var(--line);
+    }
+    .switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 14px;
+      user-select: none;
+    }
+    .switch input {
+      width: 18px;
+      height: 18px;
+      padding: 0;
+    }
+    @media (max-width: 820px) {
+      main { width: min(100vw - 20px, 1120px); padding-top: 28px; }
+      header, .toolbar { align-items: flex-start; flex-direction: column; }
+      .cards, .storage { grid-template-columns: 1fr 1fr; }
+      table { display: block; overflow-x: auto; }
+    }
+    @media (max-width: 560px) {
+      .cards, .storage { grid-template-columns: 1fr; }
+      .login { max-width: none; }
+      th, td { padding: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>路过心动后台</h1>
+        <p class="sub">查看持久化状态、用户数量、地点数量和每个用户的保存情况。</p>
+      </div>
+      <div id="headerActions" class="row hidden">
+        <button id="refreshButton" type="button">刷新数据</button>
+        <button id="logoutButton" class="secondary" type="button">退出登录</button>
+      </div>
+    </header>
+
+    <section id="loginPanel" class="panel login hidden">
+      <form id="loginForm">
+        <label for="tokenInput">管理员 Token</label>
+        <input id="tokenInput" name="token" type="password" autocomplete="current-password" placeholder="输入 Zeabur 的 ADMIN_TOKEN" />
+        <div class="row" style="margin-top: 16px;">
+          <button id="loginButton" type="submit">进入后台</button>
+        </div>
+        <div id="loginStatus" class="status"></div>
+      </form>
+    </section>
+
+    <section id="dashboard" class="hidden">
+      <div class="toolbar">
+        <div id="updatedAt" class="label"></div>
+        <label class="switch">
+          <input id="showIds" type="checkbox" />
+          显示完整设备 ID
+        </label>
+      </div>
+
+      <div class="cards">
+        <div class="card"><div id="usersWithData" class="metric">-</div><div class="label">有地点的用户</div></div>
+        <div class="card"><div id="usersInProfiles" class="metric">-</div><div class="label">注册过的设备档案</div></div>
+        <div class="card"><div id="totalPlaces" class="metric">-</div><div class="label">总地点数</div></div>
+        <div class="card"><div id="addressHealth" class="metric">-</div><div class="label">地址完整度</div></div>
+      </div>
+
+      <div class="panel storage">
+        <div>
+          <span id="persistentBadge" class="badge">检查中</span>
+          <code id="dbPath"></code>
+        </div>
+        <div>
+          <span id="mountBadge" class="badge">检查中</span>
+          <code id="uploadDir"></code>
+        </div>
+      </div>
+
+      <div id="emptyState" class="empty hidden">还没有用户地点数据。</div>
+      <table id="usersTable" class="hidden">
+        <thead>
+          <tr>
+            <th>用户设备</th>
+            <th>地点数</th>
+            <th>有坐标</th>
+            <th>有地址</th>
+            <th>首次保存</th>
+            <th>最近保存</th>
+          </tr>
+        </thead>
+        <tbody id="usersBody"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script>
+    const loginPanel = document.getElementById("loginPanel");
+    const dashboard = document.getElementById("dashboard");
+    const headerActions = document.getElementById("headerActions");
+    const loginForm = document.getElementById("loginForm");
+    const loginButton = document.getElementById("loginButton");
+    const loginStatus = document.getElementById("loginStatus");
+    const refreshButton = document.getElementById("refreshButton");
+    const logoutButton = document.getElementById("logoutButton");
+    const showIds = document.getElementById("showIds");
+    const usersBody = document.getElementById("usersBody");
+    const usersTable = document.getElementById("usersTable");
+    const emptyState = document.getElementById("emptyState");
+
+    function setLoginVisible(visible) {
+      loginPanel.classList.toggle("hidden", !visible);
+      dashboard.classList.toggle("hidden", visible);
+      headerActions.classList.toggle("hidden", visible);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function number(value) {
+      return Number(value ?? 0).toLocaleString("zh-CN");
+    }
+
+    function percent(part, total) {
+      if (!total) return "-";
+      return `${Math.round((Number(part || 0) / Number(total)) * 100)}%`;
+    }
+
+    function renderStats(data) {
+      setLoginVisible(false);
+      document.getElementById("usersWithData").textContent = number(data.users_with_data);
+      document.getElementById("usersInProfiles").textContent = number(data.users_in_profiles);
+      document.getElementById("totalPlaces").textContent = number(data.total_places);
+      document.getElementById("addressHealth").textContent = percent(data.places_with_address, data.total_places);
+      document.getElementById("updatedAt").textContent = `更新于 ${new Date().toLocaleString("zh-CN")}`;
+
+      const persistentBadge = document.getElementById("persistentBadge");
+      persistentBadge.textContent = data.is_likely_persistent ? "数据库已持久化" : "数据库未确认持久化";
+      persistentBadge.classList.toggle("warn", !data.is_likely_persistent);
+
+      const mountBadge = document.getElementById("mountBadge");
+      mountBadge.textContent = data.persistent_data_dir_is_mount ? "/data 已挂载 Volume" : "/data 未确认挂载";
+      mountBadge.classList.toggle("warn", !data.persistent_data_dir_is_mount);
+
+      document.getElementById("dbPath").textContent = `DB: ${data.db_path || "-"}`;
+      document.getElementById("uploadDir").textContent = `Uploads: ${data.upload_dir || "-"}`;
+
+      const users = Array.isArray(data.users) ? data.users : [];
+      emptyState.classList.toggle("hidden", users.length > 0);
+      usersTable.classList.toggle("hidden", users.length === 0);
+      usersBody.innerHTML = users.map(user => `
+        <tr>
+          <td class="device">${escapeHtml(user.device_id)}</td>
+          <td>${number(user.place_count)}</td>
+          <td>${number(user.places_with_coordinates)}</td>
+          <td>${number(user.places_with_address)}</td>
+          <td>${escapeHtml(user.first_created_at || "-")}</td>
+          <td>${escapeHtml(user.last_created_at || "-")}</td>
+        </tr>
+      `).join("");
+    }
+
+    async function loadStats() {
+      refreshButton.disabled = true;
+      const includeIds = showIds.checked ? "true" : "false";
+      try {
+        const response = await fetch(`/api/admin/stats?include_device_ids=${includeIds}&limit=1000`, {
+          credentials: "same-origin"
+        });
+        if (response.status === 403 || response.status === 503) {
+          setLoginVisible(true);
+          loginStatus.textContent = response.status === 503 ? "后端还没有配置 ADMIN_TOKEN。" : "";
+          loginStatus.classList.toggle("error", response.status === 503);
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const data = await response.json();
+        renderStats(data);
+      } catch (error) {
+        setLoginVisible(true);
+        loginStatus.textContent = `读取失败：${error.message}`;
+        loginStatus.classList.add("error");
+      } finally {
+        refreshButton.disabled = false;
+      }
+    }
+
+    loginForm.addEventListener("submit", async event => {
+      event.preventDefault();
+      loginStatus.textContent = "正在验证...";
+      loginStatus.classList.remove("error");
+      loginButton.disabled = true;
+      try {
+        const token = document.getElementById("tokenInput").value.trim();
+        const response = await fetch("/api/admin/login", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token })
+        });
+        if (!response.ok) {
+          throw new Error(response.status === 403 ? "Token 不对" : `HTTP ${response.status}`);
+        }
+        document.getElementById("tokenInput").value = "";
+        await loadStats();
+      } catch (error) {
+        loginStatus.textContent = `登录失败：${error.message}`;
+        loginStatus.classList.add("error");
+      } finally {
+        loginButton.disabled = false;
+      }
+    });
+
+    refreshButton.addEventListener("click", loadStats);
+    showIds.addEventListener("change", loadStats);
+    logoutButton.addEventListener("click", async () => {
+      await fetch("/api/admin/logout", { method: "POST", credentials: "same-origin" });
+      setLoginVisible(true);
+    });
+
+    loadStats();
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_dashboard():
+    return HTMLResponse(ADMIN_DASHBOARD_HTML)
+
+
+@app.post("/api/admin/login")
+def admin_login(payload: AdminLoginRequest, response: Response):
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="ADMIN_TOKEN_NOT_CONFIGURED")
+    token = payload.token.strip()
+    if not hmac.compare_digest(token, ADMIN_TOKEN):
+        raise HTTPException(status_code=403, detail="ADMIN_FORBIDDEN")
+    response.set_cookie(
+        key=ADMIN_COOKIE_NAME,
+        value=token,
+        max_age=30 * 24 * 60 * 60,
+        httponly=True,
+        secure=APP_ENV == "production",
+        samesite="lax",
+        path="/",
+    )
+    return {"ok": True}
+
+
+@app.post("/api/admin/logout")
+def admin_logout(response: Response):
+    response.delete_cookie(key=ADMIN_COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
 @app.get("/healthz")
 def healthz():
     storage_uses_persistent_dir = (
