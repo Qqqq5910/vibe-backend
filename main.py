@@ -61,7 +61,7 @@ AMAP_KEY = os.getenv("AMAP_KEY", "")
 QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
 MIN_SUPPORTED_IOS_VERSION = os.getenv("MIN_SUPPORTED_IOS_VERSION", "1.3")
 LATEST_IOS_VERSION = os.getenv("LATEST_IOS_VERSION", MIN_SUPPORTED_IOS_VERSION)
-APP_STORE_URL = os.getenv("APP_STORE_URL", "https://apps.apple.com/cn/app/id6770473628")
+APP_STORE_URL = os.getenv("APP_STORE_URL") or "https://apps.apple.com/cn/app/id6770473628"
 FORCE_UPDATE_MESSAGE = os.getenv("FORCE_UPDATE_MESSAGE", "这个版本已经停止使用，请更新到最新版后继续。")
 FORCE_UPDATE_AFTER = os.getenv("FORCE_UPDATE_AFTER", "")
 ENFORCE_WHEN_APP_STORE_VERSION_AVAILABLE = os.getenv("ENFORCE_WHEN_APP_STORE_VERSION_AVAILABLE", "1") != "0"
