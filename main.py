@@ -538,6 +538,45 @@ def masked_device_id(device_id: str) -> str:
     return f"{value[:8]}...{value[-4:]}"
 
 
+def escape_sql_like(value: str) -> str:
+    return (
+        value
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+
+
+def admin_place_payload(row: sqlite3.Row, include_device_id: bool = False) -> dict:
+    name = row["amap_name"] or row["brand"] or ""
+    address = row["amap_address"] or row["city"] or ""
+    lat = float(row["poi_lat"] or 0.0)
+    lon = float(row["poi_lon"] or 0.0)
+    has_coordinates = lat != 0.0 and lon != 0.0
+    map_url = ""
+    if has_coordinates:
+        map_url = f"https://maps.apple.com/?ll={lat},{lon}&q={quote_plus(name or address)}"
+
+    payload = {
+        "id": row["id"],
+        "brand": row["brand"],
+        "name": name,
+        "city": row["city"],
+        "district": row["amap_district"] or "",
+        "address": address,
+        "location": row["amap_location"] or "",
+        "lat": lat,
+        "lon": lon,
+        "has_coordinates": has_coordinates,
+        "created_at": row["created_at"],
+        "image_url": row["image_url"] or "",
+        "map_url": map_url,
+    }
+    if include_device_id:
+        payload["device_id"] = row["device_id"]
+    return payload
+
+
 def build_openai_client() -> AsyncOpenAI:
     if not QWEN_API_KEY:
         raise HTTPException(status_code=500, detail="QWEN_API_KEY_MISSING")
@@ -1190,6 +1229,38 @@ ADMIN_DASHBOARD_HTML = r"""
       font-size: 13px;
       font-weight: 800;
     }
+    .search-panel {
+      padding: 18px;
+      margin-bottom: 14px;
+    }
+    .search-form {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: end;
+    }
+    .search-results {
+      display: grid;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .search-result {
+      display: grid;
+      grid-template-columns: minmax(180px, 0.9fr) minmax(220px, 1.3fr) minmax(180px, 0.9fr) auto;
+      gap: 12px;
+      align-items: start;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.86);
+    }
+    .search-device {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      overflow-wrap: anywhere;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
     .empty {
       padding: 28px;
       text-align: center;
@@ -1216,6 +1287,7 @@ ADMIN_DASHBOARD_HTML = r"""
       header, .toolbar { align-items: flex-start; flex-direction: column; }
       .cards, .storage { grid-template-columns: 1fr 1fr; }
       .place-item { grid-template-columns: 1fr; }
+      .search-form, .search-result { grid-template-columns: 1fr; }
       .place-actions { justify-content: flex-start; }
       table { display: block; overflow-x: auto; }
     }
@@ -1277,6 +1349,18 @@ ADMIN_DASHBOARD_HTML = r"""
         </div>
       </div>
 
+      <div class="panel search-panel">
+        <form id="searchForm" class="search-form">
+          <div>
+            <label for="searchInput">搜索用户旧数据</label>
+            <input id="searchInput" type="search" placeholder="输入店名、城市、地址或设备 ID 片段" />
+          </div>
+          <button id="searchButton" type="submit">搜索</button>
+        </form>
+        <div id="searchStatus" class="status"></div>
+        <div id="searchResults" class="search-results"></div>
+      </div>
+
       <div id="emptyState" class="empty hidden">还没有用户地点数据。</div>
       <table id="usersTable" class="hidden">
         <thead>
@@ -1308,7 +1392,13 @@ ADMIN_DASHBOARD_HTML = r"""
     const usersBody = document.getElementById("usersBody");
     const usersTable = document.getElementById("usersTable");
     const emptyState = document.getElementById("emptyState");
+    const searchForm = document.getElementById("searchForm");
+    const searchInput = document.getElementById("searchInput");
+    const searchButton = document.getElementById("searchButton");
+    const searchStatus = document.getElementById("searchStatus");
+    const searchResults = document.getElementById("searchResults");
     const placesCache = new Map();
+    let latestSearchResults = [];
 
     function setLoginVisible(visible) {
       loginPanel.classList.toggle("hidden", !visible);
@@ -1365,6 +1455,35 @@ ADMIN_DASHBOARD_HTML = r"""
           `).join("")}
         </div>
       `;
+    }
+
+    function renderSearchResults(results) {
+      latestSearchResults = Array.isArray(results) ? results : [];
+      if (latestSearchResults.length === 0) {
+        searchResults.innerHTML = "";
+        return;
+      }
+
+      searchResults.innerHTML = latestSearchResults.map(result => `
+        <div class="search-result">
+          <div>
+            <div class="place-name">${escapeHtml(result.name || result.brand || "未命名地点")}</div>
+            <div class="place-meta">${escapeHtml(result.created_at || "-")}</div>
+          </div>
+          <div>
+            <div class="place-address">${escapeHtml(result.address || "地址未记录")}</div>
+            <div class="place-meta">${escapeHtml(result.city || "")}${result.has_coordinates ? ` · ${escapeHtml(result.lat)}, ${escapeHtml(result.lon)}` : ""}</div>
+          </div>
+          <div>
+            <div class="label">用户设备</div>
+            <div class="search-device">${escapeHtml(maskDeviceId(result.device_id))}</div>
+          </div>
+          <div class="place-actions">
+            ${result.map_url ? `<a href="${escapeHtml(result.map_url)}" target="_blank" rel="noreferrer">地图</a>` : ""}
+            ${result.image_url ? `<a href="${escapeHtml(result.image_url)}" target="_blank" rel="noreferrer">截图</a>` : ""}
+          </div>
+        </div>
+      `).join("");
     }
 
     function renderStats(data) {
@@ -1472,6 +1591,38 @@ ADMIN_DASHBOARD_HTML = r"""
       }
     }
 
+    async function searchPlaces(event) {
+      event.preventDefault();
+      const query = searchInput.value.trim();
+      if (query.length < 2) {
+        searchStatus.textContent = "至少输入 2 个字。";
+        searchStatus.classList.add("error");
+        renderSearchResults([]);
+        return;
+      }
+
+      searchButton.disabled = true;
+      searchStatus.textContent = "正在搜索...";
+      searchStatus.classList.remove("error");
+      renderSearchResults([]);
+
+      try {
+        const response = await fetch(`/api/admin/search?q=${encodeURIComponent(query)}&limit=100`, {
+          credentials: "same-origin"
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        const results = Array.isArray(data.results) ? data.results : [];
+        searchStatus.textContent = `找到 ${results.length} 条匹配记录`;
+        renderSearchResults(results);
+      } catch (error) {
+        searchStatus.textContent = `搜索失败：${error.message}`;
+        searchStatus.classList.add("error");
+      } finally {
+        searchButton.disabled = false;
+      }
+    }
+
     loginForm.addEventListener("submit", async event => {
       event.preventDefault();
       loginStatus.textContent = "正在验证...";
@@ -1506,7 +1657,9 @@ ADMIN_DASHBOARD_HTML = r"""
         const cell = row.querySelector(".device");
         if (button && cell) cell.textContent = maskDeviceId(button.dataset.deviceId);
       });
+      renderSearchResults(latestSearchResults);
     });
+    searchForm.addEventListener("submit", searchPlaces);
     usersBody.addEventListener("click", event => {
       const button = event.target.closest(".places-button");
       if (button) toggleUserPlaces(button);
@@ -1662,6 +1815,59 @@ def admin_stats(request: Request, limit: int = 100, include_device_ids: bool = F
     }
 
 
+@app.get("/api/admin/search")
+def admin_search(request: Request, q: str, limit: int = 100):
+    require_admin(request)
+    query = (q or "").strip()
+    if len(query) < 2:
+        raise HTTPException(status_code=400, detail="QUERY_TOO_SHORT")
+    limit = max(1, min(limit, 300))
+    pattern = f"%{escape_sql_like(query.lower())}%"
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        rows = cursor.execute(
+            """
+            SELECT
+                id,
+                brand,
+                city,
+                created_at,
+                image_url,
+                device_id,
+                poi_lat,
+                poi_lon,
+                amap_name,
+                amap_address,
+                amap_location,
+                amap_district
+            FROM memory_pool
+            WHERE device_id IS NOT NULL
+              AND TRIM(device_id) != ''
+              AND (
+                LOWER(COALESCE(device_id, '')) LIKE ? ESCAPE '\\'
+                OR LOWER(COALESCE(brand, '')) LIKE ? ESCAPE '\\'
+                OR LOWER(COALESCE(city, '')) LIKE ? ESCAPE '\\'
+                OR LOWER(COALESCE(amap_name, '')) LIKE ? ESCAPE '\\'
+                OR LOWER(COALESCE(amap_address, '')) LIKE ? ESCAPE '\\'
+                OR LOWER(COALESCE(amap_location, '')) LIKE ? ESCAPE '\\'
+                OR LOWER(COALESCE(amap_district, '')) LIKE ? ESCAPE '\\'
+              )
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (pattern, pattern, pattern, pattern, pattern, pattern, pattern, limit),
+        ).fetchall()
+
+    results = [admin_place_payload(row, include_device_id=True) for row in rows]
+    return {
+        "query": query,
+        "result_count": len(results),
+        "matched_user_count": len({result["device_id"] for result in results}),
+        "results": results,
+    }
+
+
 @app.get("/api/admin/users/{device_id}/places")
 def admin_user_places(device_id: str, request: Request, limit: int = 200):
     require_admin(request)
@@ -1694,34 +1900,7 @@ def admin_user_places(device_id: str, request: Request, limit: int = 200):
             (device_id, limit),
         ).fetchall()
 
-    places = []
-    for row in rows:
-        name = row["amap_name"] or row["brand"] or ""
-        address = row["amap_address"] or row["city"] or ""
-        lat = row["poi_lat"]
-        lon = row["poi_lon"]
-        has_coordinates = lat != 0.0 and lon != 0.0
-        map_url = ""
-        if has_coordinates:
-            map_url = f"https://maps.apple.com/?ll={lat},{lon}&q={quote_plus(name or address)}"
-
-        places.append(
-            {
-                "id": row["id"],
-                "brand": row["brand"],
-                "name": name,
-                "city": row["city"],
-                "district": row["amap_district"] or "",
-                "address": address,
-                "location": row["amap_location"] or "",
-                "lat": lat,
-                "lon": lon,
-                "has_coordinates": has_coordinates,
-                "created_at": row["created_at"],
-                "image_url": row["image_url"] or "",
-                "map_url": map_url,
-            }
-        )
+    places = [admin_place_payload(row) for row in rows]
 
     return {
         "device_id": device_id,
