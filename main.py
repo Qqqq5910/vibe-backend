@@ -15,6 +15,7 @@ import shutil
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from typing import Optional, Dict, Deque, Tuple, List
+from urllib.parse import quote_plus
 
 import jwt
 from dotenv import load_dotenv
@@ -1128,6 +1129,67 @@ ADMIN_DASHBOARD_HTML = r"""
       overflow-wrap: anywhere;
       max-width: 360px;
     }
+    button.small {
+      border-radius: 12px;
+      padding: 8px 12px;
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .places-row td {
+      padding: 0;
+      background: rgba(246, 250, 248, 0.72);
+    }
+    .places-panel {
+      margin: 0;
+      padding: 18px;
+      border-top: 1px solid var(--line);
+    }
+    .places-note {
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 12px;
+    }
+    .place-list {
+      display: grid;
+      gap: 10px;
+    }
+    .place-item {
+      display: grid;
+      grid-template-columns: minmax(180px, 1.1fr) minmax(220px, 1.6fr) auto;
+      gap: 12px;
+      align-items: start;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.86);
+    }
+    .place-name {
+      font-weight: 900;
+      margin-bottom: 6px;
+    }
+    .place-meta, .place-address {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+    .place-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .place-actions a {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 7px 10px;
+      color: var(--lake);
+      background: rgba(34, 119, 150, 0.10);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 800;
+    }
     .empty {
       padding: 28px;
       text-align: center;
@@ -1153,6 +1215,8 @@ ADMIN_DASHBOARD_HTML = r"""
       main { width: min(100vw - 20px, 1120px); padding-top: 28px; }
       header, .toolbar { align-items: flex-start; flex-direction: column; }
       .cards, .storage { grid-template-columns: 1fr 1fr; }
+      .place-item { grid-template-columns: 1fr; }
+      .place-actions { justify-content: flex-start; }
       table { display: block; overflow-x: auto; }
     }
     @media (max-width: 560px) {
@@ -1223,6 +1287,7 @@ ADMIN_DASHBOARD_HTML = r"""
             <th>有地址</th>
             <th>首次保存</th>
             <th>最近保存</th>
+            <th>存过地点</th>
           </tr>
         </thead>
         <tbody id="usersBody"></tbody>
@@ -1243,6 +1308,7 @@ ADMIN_DASHBOARD_HTML = r"""
     const usersBody = document.getElementById("usersBody");
     const usersTable = document.getElementById("usersTable");
     const emptyState = document.getElementById("emptyState");
+    const placesCache = new Map();
 
     function setLoginVisible(visible) {
       loginPanel.classList.toggle("hidden", !visible);
@@ -1268,6 +1334,39 @@ ADMIN_DASHBOARD_HTML = r"""
       return `${Math.round((Number(part || 0) / Number(total)) * 100)}%`;
     }
 
+    function maskDeviceId(value) {
+      const text = String(value || "").trim();
+      if (showIds.checked || text.length <= 12) return text;
+      return `${text.slice(0, 8)}...${text.slice(-4)}`;
+    }
+
+    function renderPlaceList(places) {
+      if (!Array.isArray(places) || places.length === 0) {
+        return `<div class="empty">这个用户还没有地点记录。</div>`;
+      }
+      return `
+        <div class="places-note">下面只展示用户存过的地点记录，不包含设备地址或 IP。</div>
+        <div class="place-list">
+          ${places.map(place => `
+            <div class="place-item">
+              <div>
+                <div class="place-name">${escapeHtml(place.name || place.brand || "未命名地点")}</div>
+                <div class="place-meta">${escapeHtml(place.created_at || "-")}</div>
+              </div>
+              <div>
+                <div class="place-address">${escapeHtml(place.address || "地址未记录")}</div>
+                <div class="place-meta">${escapeHtml(place.city || "")}${place.has_coordinates ? ` · ${escapeHtml(place.lat)}, ${escapeHtml(place.lon)}` : ""}</div>
+              </div>
+              <div class="place-actions">
+                ${place.map_url ? `<a href="${escapeHtml(place.map_url)}" target="_blank" rel="noreferrer">地图</a>` : ""}
+                ${place.image_url ? `<a href="${escapeHtml(place.image_url)}" target="_blank" rel="noreferrer">截图</a>` : ""}
+              </div>
+            </div>
+          `).join("")}
+        </div>
+      `;
+    }
+
     function renderStats(data) {
       setLoginVisible(false);
       document.getElementById("usersWithData").textContent = number(data.users_with_data);
@@ -1290,21 +1389,29 @@ ADMIN_DASHBOARD_HTML = r"""
       const users = Array.isArray(data.users) ? data.users : [];
       emptyState.classList.toggle("hidden", users.length > 0);
       usersTable.classList.toggle("hidden", users.length === 0);
-      usersBody.innerHTML = users.map(user => `
+      usersBody.innerHTML = users.map((user, index) => `
         <tr>
-          <td class="device">${escapeHtml(user.device_id)}</td>
+          <td class="device">${escapeHtml(maskDeviceId(user.device_id))}</td>
           <td>${number(user.place_count)}</td>
           <td>${number(user.places_with_coordinates)}</td>
           <td>${number(user.places_with_address)}</td>
           <td>${escapeHtml(user.first_created_at || "-")}</td>
           <td>${escapeHtml(user.last_created_at || "-")}</td>
+          <td><button class="secondary small places-button" type="button" data-device-id="${escapeHtml(user.device_id)}" data-target="places-${index}">展开</button></td>
+        </tr>
+        <tr id="places-${index}" class="places-row hidden">
+          <td colspan="7">
+            <div class="places-panel">
+              <div class="places-note">正在读取地点...</div>
+            </div>
+          </td>
         </tr>
       `).join("");
     }
 
     async function loadStats() {
       refreshButton.disabled = true;
-      const includeIds = showIds.checked ? "true" : "false";
+      const includeIds = "true";
       try {
         const response = await fetch(`/api/admin/stats?include_device_ids=${includeIds}&limit=1000`, {
           credentials: "same-origin"
@@ -1326,6 +1433,42 @@ ADMIN_DASHBOARD_HTML = r"""
         loginStatus.classList.add("error");
       } finally {
         refreshButton.disabled = false;
+      }
+    }
+
+    async function toggleUserPlaces(button) {
+      const deviceId = button.dataset.deviceId;
+      const target = document.getElementById(button.dataset.target);
+      if (!deviceId || !target) return;
+
+      const isHidden = target.classList.contains("hidden");
+      if (!isHidden) {
+        target.classList.add("hidden");
+        button.textContent = "展开";
+        return;
+      }
+
+      target.classList.remove("hidden");
+      button.textContent = "收起";
+
+      const panel = target.querySelector(".places-panel");
+      if (placesCache.has(deviceId)) {
+        panel.innerHTML = renderPlaceList(placesCache.get(deviceId));
+        return;
+      }
+
+      panel.innerHTML = `<div class="places-note">正在读取地点...</div>`;
+      try {
+        const response = await fetch(`/api/admin/users/${encodeURIComponent(deviceId)}/places?limit=500`, {
+          credentials: "same-origin"
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        const places = Array.isArray(data.places) ? data.places : [];
+        placesCache.set(deviceId, places);
+        panel.innerHTML = renderPlaceList(places);
+      } catch (error) {
+        panel.innerHTML = `<div class="places-note">读取失败：${escapeHtml(error.message)}</div>`;
       }
     }
 
@@ -1356,7 +1499,18 @@ ADMIN_DASHBOARD_HTML = r"""
     });
 
     refreshButton.addEventListener("click", loadStats);
-    showIds.addEventListener("change", loadStats);
+    showIds.addEventListener("change", () => {
+      const rows = Array.from(usersBody.querySelectorAll("tr")).filter(row => !row.classList.contains("places-row"));
+      rows.forEach(row => {
+        const button = row.querySelector(".places-button");
+        const cell = row.querySelector(".device");
+        if (button && cell) cell.textContent = maskDeviceId(button.dataset.deviceId);
+      });
+    });
+    usersBody.addEventListener("click", event => {
+      const button = event.target.closest(".places-button");
+      if (button) toggleUserPlaces(button);
+    });
     logoutButton.addEventListener("click", async () => {
       await fetch("/api/admin/logout", { method: "POST", credentials: "same-origin" });
       setLoginVisible(true);
@@ -1505,6 +1659,74 @@ def admin_stats(request: Request, limit: int = 100, include_device_ids: bool = F
             }
             for row in top_users
         ],
+    }
+
+
+@app.get("/api/admin/users/{device_id}/places")
+def admin_user_places(device_id: str, request: Request, limit: int = 200):
+    require_admin(request)
+    device_id = device_id.strip()
+    if not device_id:
+        raise HTTPException(status_code=400, detail="DEVICE_ID_REQUIRED")
+    limit = max(1, min(limit, 1000))
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        rows = cursor.execute(
+            """
+            SELECT
+                id,
+                brand,
+                city,
+                created_at,
+                image_url,
+                poi_lat,
+                poi_lon,
+                amap_name,
+                amap_address,
+                amap_location,
+                amap_district
+            FROM memory_pool
+            WHERE device_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (device_id, limit),
+        ).fetchall()
+
+    places = []
+    for row in rows:
+        name = row["amap_name"] or row["brand"] or ""
+        address = row["amap_address"] or row["city"] or ""
+        lat = row["poi_lat"]
+        lon = row["poi_lon"]
+        has_coordinates = lat != 0.0 and lon != 0.0
+        map_url = ""
+        if has_coordinates:
+            map_url = f"https://maps.apple.com/?ll={lat},{lon}&q={quote_plus(name or address)}"
+
+        places.append(
+            {
+                "id": row["id"],
+                "brand": row["brand"],
+                "name": name,
+                "city": row["city"],
+                "district": row["amap_district"] or "",
+                "address": address,
+                "location": row["amap_location"] or "",
+                "lat": lat,
+                "lon": lon,
+                "has_coordinates": has_coordinates,
+                "created_at": row["created_at"],
+                "image_url": row["image_url"] or "",
+                "map_url": map_url,
+            }
+        )
+
+    return {
+        "device_id": device_id,
+        "place_count": len(places),
+        "places": places,
     }
 
 
