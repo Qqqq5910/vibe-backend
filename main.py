@@ -155,6 +155,12 @@ class AdminLoginRequest(BaseModel):
     token: str = Field(min_length=16, max_length=256)
 
 
+class AdminMigrateRequest(BaseModel):
+    from_device_id: str = Field(min_length=8, max_length=128)
+    to_device_id: str = Field(min_length=8, max_length=128)
+    dry_run: bool = False
+
+
 # -----------------------------
 # Lightweight rate limiter
 # -----------------------------
@@ -575,6 +581,20 @@ def admin_place_payload(row: sqlite3.Row, include_device_id: bool = False) -> di
     if include_device_id:
         payload["device_id"] = row["device_id"]
     return payload
+
+
+def normalized_admin_place_value(value: str) -> str:
+    return re.sub(r"[\s\W_]+", "", (value or "").strip().lower())
+
+
+def admin_place_duplicate_key(row: sqlite3.Row) -> tuple:
+    name_key = normalized_admin_place_value(row["amap_name"] or row["brand"] or "")
+    address_key = normalized_admin_place_value(row["amap_address"] or "")
+    lat = float(row["poi_lat"] or 0.0)
+    lon = float(row["poi_lon"] or 0.0)
+    if lat != 0.0 and lon != 0.0:
+        return ("coord", name_key, round(lat, 5), round(lon, 5))
+    return ("text", name_key, address_key)
 
 
 def build_openai_client() -> AsyncOpenAI:
@@ -1239,6 +1259,12 @@ ADMIN_DASHBOARD_HTML = r"""
       gap: 12px;
       align-items: end;
     }
+    .migrate-form {
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) auto;
+      gap: 12px;
+      align-items: end;
+    }
     .search-results {
       display: grid;
       gap: 10px;
@@ -1287,7 +1313,7 @@ ADMIN_DASHBOARD_HTML = r"""
       header, .toolbar { align-items: flex-start; flex-direction: column; }
       .cards, .storage { grid-template-columns: 1fr 1fr; }
       .place-item { grid-template-columns: 1fr; }
-      .search-form, .search-result { grid-template-columns: 1fr; }
+      .search-form, .migrate-form, .search-result { grid-template-columns: 1fr; }
       .place-actions { justify-content: flex-start; }
       table { display: block; overflow-x: auto; }
     }
@@ -1361,6 +1387,21 @@ ADMIN_DASHBOARD_HTML = r"""
         <div id="searchResults" class="search-results"></div>
       </div>
 
+      <div class="panel search-panel">
+        <form id="migrateForm" class="migrate-form">
+          <div>
+            <label for="fromDeviceInput">旧设备 ID</label>
+            <input id="fromDeviceInput" type="text" placeholder="要恢复的数据来自这个 ID" />
+          </div>
+          <div>
+            <label for="toDeviceInput">新设备 ID</label>
+            <input id="toDeviceInput" type="text" placeholder="复制到用户现在的 ID" />
+          </div>
+          <button id="migrateButton" type="submit">复制恢复</button>
+        </form>
+        <div id="migrateStatus" class="status">只复制地点到新 ID，不删除旧 ID 数据。</div>
+      </div>
+
       <div id="emptyState" class="empty hidden">还没有用户地点数据。</div>
       <table id="usersTable" class="hidden">
         <thead>
@@ -1397,6 +1438,11 @@ ADMIN_DASHBOARD_HTML = r"""
     const searchButton = document.getElementById("searchButton");
     const searchStatus = document.getElementById("searchStatus");
     const searchResults = document.getElementById("searchResults");
+    const migrateForm = document.getElementById("migrateForm");
+    const fromDeviceInput = document.getElementById("fromDeviceInput");
+    const toDeviceInput = document.getElementById("toDeviceInput");
+    const migrateButton = document.getElementById("migrateButton");
+    const migrateStatus = document.getElementById("migrateStatus");
     const placesCache = new Map();
     let latestSearchResults = [];
 
@@ -1479,6 +1525,7 @@ ADMIN_DASHBOARD_HTML = r"""
             <div class="search-device">${escapeHtml(maskDeviceId(result.device_id))}</div>
           </div>
           <div class="place-actions">
+            <button class="secondary small fill-old-device-button" type="button" data-device-id="${escapeHtml(result.device_id)}">填旧 ID</button>
             ${result.map_url ? `<a href="${escapeHtml(result.map_url)}" target="_blank" rel="noreferrer">地图</a>` : ""}
             ${result.image_url ? `<a href="${escapeHtml(result.image_url)}" target="_blank" rel="noreferrer">截图</a>` : ""}
           </div>
@@ -1623,6 +1670,56 @@ ADMIN_DASHBOARD_HTML = r"""
       }
     }
 
+    async function migrateUserData(event) {
+      event.preventDefault();
+      const fromDeviceId = fromDeviceInput.value.trim();
+      const toDeviceId = toDeviceInput.value.trim();
+
+      migrateStatus.classList.remove("error");
+      if (fromDeviceId.length < 8 || toDeviceId.length < 8) {
+        migrateStatus.textContent = "旧设备 ID 和新设备 ID 都至少需要 8 位。";
+        migrateStatus.classList.add("error");
+        return;
+      }
+      if (fromDeviceId === toDeviceId) {
+        migrateStatus.textContent = "旧设备 ID 和新设备 ID 不能相同。";
+        migrateStatus.classList.add("error");
+        return;
+      }
+
+      const ok = window.confirm("确认把旧设备 ID 的地点复制到新设备 ID？旧数据不会删除。");
+      if (!ok) return;
+
+      migrateButton.disabled = true;
+      migrateStatus.textContent = "正在复制恢复...";
+
+      try {
+        const response = await fetch("/api/admin/migrate", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from_device_id: fromDeviceId,
+            to_device_id: toDeviceId,
+            dry_run: false
+          })
+        });
+        if (!response.ok) {
+          const message = response.status === 404 ? "旧设备 ID 没有地点记录" : `HTTP ${response.status}`;
+          throw new Error(message);
+        }
+        const data = await response.json();
+        placesCache.delete(toDeviceId);
+        migrateStatus.textContent = `恢复完成：复制 ${data.copied_count} 个地点，跳过 ${data.skipped_duplicate_count} 个重复。旧 ID 数据仍保留。`;
+        await loadStats();
+      } catch (error) {
+        migrateStatus.textContent = `恢复失败：${error.message}`;
+        migrateStatus.classList.add("error");
+      } finally {
+        migrateButton.disabled = false;
+      }
+    }
+
     loginForm.addEventListener("submit", async event => {
       event.preventDefault();
       loginStatus.textContent = "正在验证...";
@@ -1660,6 +1757,14 @@ ADMIN_DASHBOARD_HTML = r"""
       renderSearchResults(latestSearchResults);
     });
     searchForm.addEventListener("submit", searchPlaces);
+    migrateForm.addEventListener("submit", migrateUserData);
+    searchResults.addEventListener("click", event => {
+      const button = event.target.closest(".fill-old-device-button");
+      if (!button) return;
+      fromDeviceInput.value = button.dataset.deviceId || "";
+      migrateStatus.classList.remove("error");
+      migrateStatus.textContent = "已填入旧设备 ID。请再填新设备 ID 后复制恢复。";
+    });
     usersBody.addEventListener("click", event => {
       const button = event.target.closest(".places-button");
       if (button) toggleUserPlaces(button);
@@ -1865,6 +1970,123 @@ def admin_search(request: Request, q: str, limit: int = 100):
         "result_count": len(results),
         "matched_user_count": len({result["device_id"] for result in results}),
         "results": results,
+    }
+
+
+@app.post("/api/admin/migrate")
+def admin_migrate_user_data(payload: AdminMigrateRequest, request: Request):
+    require_admin(request)
+    from_device_id = payload.from_device_id.strip()
+    to_device_id = payload.to_device_id.strip()
+    if from_device_id == to_device_id:
+        raise HTTPException(status_code=400, detail="SAME_DEVICE_ID")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        source_rows = cursor.execute(
+            """
+            SELECT
+                id,
+                brand,
+                city,
+                created_at,
+                image_url,
+                device_id,
+                poi_lat,
+                poi_lon,
+                amap_name,
+                amap_address,
+                amap_location,
+                amap_district
+            FROM memory_pool
+            WHERE device_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (from_device_id,),
+        ).fetchall()
+
+        if not source_rows:
+            raise HTTPException(status_code=404, detail="SOURCE_USER_HAS_NO_PLACES")
+
+        target_rows = cursor.execute(
+            """
+            SELECT
+                id,
+                brand,
+                city,
+                created_at,
+                image_url,
+                device_id,
+                poi_lat,
+                poi_lon,
+                amap_name,
+                amap_address,
+                amap_location,
+                amap_district
+            FROM memory_pool
+            WHERE device_id = ?
+            """,
+            (to_device_id,),
+        ).fetchall()
+
+        existing_keys = {admin_place_duplicate_key(row) for row in target_rows}
+        rows_to_copy = []
+        skipped_duplicates = 0
+        for row in source_rows:
+            key = admin_place_duplicate_key(row)
+            if key in existing_keys:
+                skipped_duplicates += 1
+                continue
+            existing_keys.add(key)
+            rows_to_copy.append(row)
+
+        copied_ids = []
+        if not payload.dry_run:
+            get_or_create_user_profile(conn, to_device_id)
+            for row in rows_to_copy:
+                cursor.execute(
+                    """
+                    INSERT INTO memory_pool (
+                        brand,
+                        city,
+                        image_url,
+                        created_at,
+                        device_id,
+                        poi_lat,
+                        poi_lon,
+                        amap_name,
+                        amap_address,
+                        amap_location,
+                        amap_district
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["brand"],
+                        row["city"],
+                        row["image_url"],
+                        row["created_at"],
+                        to_device_id,
+                        row["poi_lat"],
+                        row["poi_lon"],
+                        row["amap_name"],
+                        row["amap_address"],
+                        row["amap_location"],
+                        row["amap_district"],
+                    ),
+                )
+                copied_ids.append(cursor.lastrowid)
+
+    return {
+        "status": "dry_run" if payload.dry_run else "success",
+        "from_device_id": from_device_id,
+        "to_device_id": to_device_id,
+        "source_place_count": len(source_rows),
+        "target_existing_place_count": len(target_rows),
+        "skipped_duplicate_count": skipped_duplicates,
+        "would_copy_count": len(rows_to_copy),
+        "copied_count": 0 if payload.dry_run else len(copied_ids),
+        "copied_ids": [] if payload.dry_run else copied_ids,
     }
 
 
