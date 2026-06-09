@@ -1263,6 +1263,62 @@ ADMIN_DASHBOARD_HTML = r"""
       padding: 18px;
       margin-bottom: 14px;
     }
+    .admin-tools {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+    .tool-card {
+      background: var(--solid);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      box-shadow: 0 10px 28px rgba(43, 75, 67, 0.07);
+      overflow: hidden;
+    }
+    .tool-card summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 18px;
+      cursor: pointer;
+      list-style: none;
+      user-select: none;
+    }
+    .tool-card summary::-webkit-details-marker {
+      display: none;
+    }
+    .tool-title {
+      display: block;
+      font-weight: 900;
+      margin-bottom: 5px;
+    }
+    .tool-desc {
+      display: block;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .tool-chevron {
+      flex: 0 0 auto;
+      color: var(--lake);
+      font-size: 13px;
+      font-weight: 900;
+    }
+    .tool-card[open] .tool-chevron {
+      color: var(--muted);
+    }
+    .tool-card[open] .tool-chevron::before {
+      content: "收起";
+    }
+    .tool-card[open] .tool-chevron span {
+      display: none;
+    }
+    .tool-body {
+      padding: 0 18px 18px;
+      border-top: 1px solid var(--line);
+    }
     .search-form {
       display: grid;
       grid-template-columns: 1fr auto;
@@ -1328,6 +1384,7 @@ ADMIN_DASHBOARD_HTML = r"""
       main { width: min(100vw - 20px, 1120px); padding-top: 28px; }
       header, .toolbar { align-items: flex-start; flex-direction: column; }
       .cards, .storage { grid-template-columns: 1fr 1fr; }
+      .admin-tools { grid-template-columns: 1fr; }
       .place-item { grid-template-columns: 1fr; }
       .search-form, .migrate-form, .delete-form, .search-result { grid-template-columns: 1fr; }
       .place-actions { justify-content: flex-start; }
@@ -1391,46 +1448,75 @@ ADMIN_DASHBOARD_HTML = r"""
         </div>
       </div>
 
-      <div class="panel search-panel">
-        <form id="searchForm" class="search-form">
-          <div>
-            <label for="searchInput">搜索用户旧数据</label>
-            <input id="searchInput" type="search" placeholder="输入店名、城市、地址或设备 ID 片段" />
+      <div class="admin-tools">
+        <details id="searchTool" class="tool-card">
+          <summary>
+            <span>
+              <span class="tool-title">搜索用户旧数据</span>
+              <span class="tool-desc">按店名、城市、地址或设备 ID 找旧记录。</span>
+            </span>
+            <span class="tool-chevron"><span>展开</span></span>
+          </summary>
+          <div class="tool-body">
+            <form id="searchForm" class="search-form">
+              <div>
+                <label for="searchInput">搜索关键词</label>
+                <input id="searchInput" type="search" placeholder="输入店名、城市、地址或设备 ID 片段" />
+              </div>
+              <button id="searchButton" type="submit">搜索</button>
+            </form>
+            <div id="searchStatus" class="status"></div>
+            <div id="searchResults" class="search-results"></div>
           </div>
-          <button id="searchButton" type="submit">搜索</button>
-        </form>
-        <div id="searchStatus" class="status"></div>
-        <div id="searchResults" class="search-results"></div>
-      </div>
+        </details>
 
-      <div class="panel search-panel">
-        <form id="migrateForm" class="migrate-form">
-          <div>
-            <label for="fromDeviceInput">旧设备 ID</label>
-            <input id="fromDeviceInput" type="text" placeholder="要恢复的数据来自这个 ID" />
+        <details id="migrateTool" class="tool-card">
+          <summary>
+            <span>
+              <span class="tool-title">用户数据迁移/恢复</span>
+              <span class="tool-desc">把旧 ID 的地点复制到新 ID，旧数据保留。</span>
+            </span>
+            <span class="tool-chevron"><span>展开</span></span>
+          </summary>
+          <div class="tool-body">
+            <form id="migrateForm" class="migrate-form">
+              <div>
+                <label for="fromDeviceInput">旧设备 ID</label>
+                <input id="fromDeviceInput" type="text" placeholder="要恢复的数据来自这个 ID" />
+              </div>
+              <div>
+                <label for="toDeviceInput">新设备 ID</label>
+                <input id="toDeviceInput" type="text" placeholder="复制到用户现在的 ID" />
+              </div>
+              <button id="migrateButton" type="submit">复制恢复</button>
+            </form>
+            <div id="migrateStatus" class="status">只复制地点到新 ID，不删除旧 ID 数据。</div>
           </div>
-          <div>
-            <label for="toDeviceInput">新设备 ID</label>
-            <input id="toDeviceInput" type="text" placeholder="复制到用户现在的 ID" />
-          </div>
-          <button id="migrateButton" type="submit">复制恢复</button>
-        </form>
-        <div id="migrateStatus" class="status">只复制地点到新 ID，不删除旧 ID 数据。</div>
-      </div>
+        </details>
 
-      <div class="panel search-panel">
-        <form id="deleteDeviceForm" class="delete-form">
-          <div>
-            <label for="deleteDeviceInput">要删除的设备 ID</label>
-            <input id="deleteDeviceInput" type="text" placeholder="删除这个 ID 的地点和档案" />
+        <details id="deleteDeviceTool" class="tool-card">
+          <summary>
+            <span>
+              <span class="tool-title">删除设备数据</span>
+              <span class="tool-desc">删除指定设备的地点和档案，需二次输入确认。</span>
+            </span>
+            <span class="tool-chevron"><span>展开</span></span>
+          </summary>
+          <div class="tool-body">
+            <form id="deleteDeviceForm" class="delete-form">
+              <div>
+                <label for="deleteDeviceInput">要删除的设备 ID</label>
+                <input id="deleteDeviceInput" type="text" placeholder="删除这个 ID 的地点和档案" />
+              </div>
+              <div>
+                <label for="confirmDeleteDeviceInput">再次输入设备 ID</label>
+                <input id="confirmDeleteDeviceInput" type="text" placeholder="必须完全一致" />
+              </div>
+              <button id="deleteDeviceButton" class="danger" type="submit">删除设备</button>
+            </form>
+            <div id="deleteDeviceStatus" class="status">会删除该设备的地点记录和用户档案，不删除上传截图文件。</div>
           </div>
-          <div>
-            <label for="confirmDeleteDeviceInput">再次输入设备 ID</label>
-            <input id="confirmDeleteDeviceInput" type="text" placeholder="必须完全一致" />
-          </div>
-          <button id="deleteDeviceButton" class="danger" type="submit">删除设备</button>
-        </form>
-        <div id="deleteDeviceStatus" class="status">会删除该设备的地点记录和用户档案，不删除上传截图文件。</div>
+        </details>
       </div>
 
       <div id="emptyState" class="empty hidden">还没有用户地点数据。</div>
@@ -1469,11 +1555,13 @@ ADMIN_DASHBOARD_HTML = r"""
     const searchButton = document.getElementById("searchButton");
     const searchStatus = document.getElementById("searchStatus");
     const searchResults = document.getElementById("searchResults");
+    const migrateTool = document.getElementById("migrateTool");
     const migrateForm = document.getElementById("migrateForm");
     const fromDeviceInput = document.getElementById("fromDeviceInput");
     const toDeviceInput = document.getElementById("toDeviceInput");
     const migrateButton = document.getElementById("migrateButton");
     const migrateStatus = document.getElementById("migrateStatus");
+    const deleteDeviceTool = document.getElementById("deleteDeviceTool");
     const deleteDeviceForm = document.getElementById("deleteDeviceForm");
     const deleteDeviceInput = document.getElementById("deleteDeviceInput");
     const confirmDeleteDeviceInput = document.getElementById("confirmDeleteDeviceInput");
@@ -1854,6 +1942,7 @@ ADMIN_DASHBOARD_HTML = r"""
       const oldButton = event.target.closest(".fill-old-device-button");
       if (oldButton) {
         fromDeviceInput.value = oldButton.dataset.deviceId || "";
+        migrateTool.open = true;
         migrateStatus.classList.remove("error");
         migrateStatus.textContent = "已填入旧设备 ID。请再填新设备 ID 后复制恢复。";
         return;
@@ -1863,6 +1952,7 @@ ADMIN_DASHBOARD_HTML = r"""
       if (deleteButton) {
         deleteDeviceInput.value = deleteButton.dataset.deviceId || "";
         confirmDeleteDeviceInput.value = "";
+        deleteDeviceTool.open = true;
         deleteDeviceStatus.classList.remove("error");
         deleteDeviceStatus.textContent = "已填入要删除的设备 ID。请再次输入同一个 ID 后删除。";
       }
